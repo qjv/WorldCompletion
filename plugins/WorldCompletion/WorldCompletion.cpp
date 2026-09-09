@@ -959,6 +959,10 @@ namespace {
                 const auto score = [&](const Candidate& option) {
                     float value = connection_cost(previous_trap, previous_point, option.trap, option.pos);
                     if (has_next) value += connection_cost(option.trap, option.pos, next_trap, next_point);
+                    if (has_next) {
+                        value += sqrtf(DistanceToSegmentSq({option.pos.x, option.pos.y},
+                            {previous_point.x, previous_point.y}, {next_point.x, next_point.y})) * .75f;
+                    }
                     return value;
                 };
                 float best_score = score(current);
@@ -981,7 +985,6 @@ namespace {
         // covered fog cell, minimizing the two neighbouring navmesh legs. This lets
         // a slightly angled through-route collect a square instead of making a
         // perpendicular visit and returning to the same corridor.
-        const auto morph_options = candidates;
         for (int pass = 0; pass < relaxation_passes; pass++) {
             bool improved = false;
             for (size_t iteration = 0; iteration < order.size(); iteration++) {
@@ -1004,11 +1007,20 @@ namespace {
                 const auto score = [&](const Candidate& option) {
                     float value = connection_cost(previous_trap, previous_point, option.trap, option.pos);
                     if (has_next) value += connection_cost(option.trap, option.pos, next_trap, next_point);
+                    if (has_next) {
+                        value += sqrtf(DistanceToSegmentSq({option.pos.x, option.pos.y},
+                            {previous_point.x, previous_point.y}, {next_point.x, next_point.y})) * .75f;
+                    }
                     return value;
                 };
                 float best_score = score(current);
                 const Candidate* best = &current;
-                for (const Candidate& option : morph_options) {
+                const auto local_options = footing_options.find({current.cell_x, current.cell_y});
+                if (local_options == footing_options.end()) {
+                    for (const uint32_t fog : current.reveals) cover_count[fog]++;
+                    continue;
+                }
+                for (const Candidate& option : local_options->second) {
                     const bool preserves_coverage = std::ranges::all_of(required, [&](const uint32_t fog) {
                         return std::ranges::find(option.reveals, fog) != option.reveals.end();
                     });
