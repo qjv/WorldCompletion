@@ -82,7 +82,7 @@ namespace {
     std::atomic_bool transition_event = false;
     std::atomic_bool recompute_requested = false;
     int arrow_size_percent = 100;
-    uint32_t route_colour = 0xF52391FFu;
+    uint32_t route_colour = IM_COL32(255, 145, 35, 245);
     int optimization_quality = 1;
     int relaxation_passes = 8;
     int randomized_restarts = 12;
@@ -1468,10 +1468,11 @@ namespace {
         const float core_width = std::clamp(thickness * 3.f, 6.f, 18.f);
         if (ground_vertices_dirty || cached_ground_thickness != thickness || cached_ground_arrow_size != arrow_scale
             || cached_ground_colour != route_colour) {
-            const auto alpha = static_cast<uint8_t>(route_colour >> 24);
-            const auto blue = static_cast<uint8_t>(route_colour >> 16);
-            const auto green = static_cast<uint8_t>(route_colour >> 8);
-            const auto red = static_cast<uint8_t>(route_colour);
+            const ImVec4 rgba = ImGui::ColorConvertU32ToFloat4(route_colour);
+            const auto red = static_cast<uint8_t>(rgba.x * 255.f + .5f);
+            const auto green = static_cast<uint8_t>(rgba.y * 255.f + .5f);
+            const auto blue = static_cast<uint8_t>(rgba.z * 255.f + .5f);
+            const auto alpha = static_cast<uint8_t>(rgba.w * 255.f + .5f);
             build_ribbon(ground_border_vertices, core_width + 5.f, D3DCOLOR_ARGB(220, 35, 12, 0));
             build_ribbon(ground_core_vertices, core_width, D3DCOLOR_ARGB(alpha, red, green, blue));
             cached_ground_thickness = thickness;
