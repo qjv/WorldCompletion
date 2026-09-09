@@ -83,7 +83,7 @@ namespace {
     std::atomic_bool recompute_requested = false;
     int arrow_size_percent = 100;
     uint32_t route_colour = IM_COL32(255, 145, 35, 245);
-    int optimization_quality = 1;
+    int optimization_quality = 2;
     int relaxation_passes = 8;
     int randomized_restarts = 12;
     uint32_t resume_after = 0;
@@ -292,6 +292,90 @@ namespace {
         }
         const auto ca = Centre(from), cb = Centre(to);
         return {(ca.x + cb.x) * 0.5f, (ca.y + cb.y) * 0.5f, 0};
+    }
+
+    std::pair<GW::Vec2f, GW::Vec2f> TransitionPortal(const GW::PathingTrapezoid* from,
+                                                      const GW::PathingTrapezoid* to)
+    {
+        const GW::Vec2f a[4] = {{from->XTL, from->YT}, {from->XTR, from->YT},
+                                 {from->XBR, from->YB}, {from->XBL, from->YB}};
+        const GW::Vec2f b[4] = {{to->XTL, to->YT}, {to->XTR, to->YT},
+                                 {to->XBR, to->YB}, {to->XBL, to->YB}};
+        const auto match = [](const GW::Vec2f& lhs, const GW::Vec2f& rhs) {
+            return fabsf(lhs.x - rhs.x) < 1.f && fabsf(lhs.y - rhs.y) < 1.f;
+        };
+        for (size_t i = 0; i < 4; i++) {
+            const auto a0 = a[i], a1 = a[(i + 1) % 4];
+            for (size_t j = 0; j < 4; j++) {
+                const auto b0 = b[j], b1 = b[(j + 1) % 4];
+                if (!((match(a0, b0) && match(a1, b1)) || (match(a0, b1) && match(a1, b0)))) continue;
+                const auto from_center = Centre(from), to_center = Centre(to);
+                const GW::Vec2f direction{to_center.x - from_center.x, to_center.y - from_center.y};
+                const GW::Vec2f midpoint{(a0.x + a1.x) * .5f, (a0.y + a1.y) * .5f};
+                const float side = direction.x * (a0.y - midpoint.y) - direction.y * (a0.x - midpoint.x);
+                return side >= 0.f ? std::pair{a0, a1} : std::pair{a1, a0};
+            }
+        }
+        const auto point = TransitionPoint(from, to);
+        return {{point.x, point.y}, {point.x, point.y}};
+    }
+
+    std::vector<GW::GamePos> PullCorridor(const GW::GamePos& start, const GW::GamePos& finish,
+                                           const std::vector<const GW::PathingTrapezoid*>& corridor,
+                                           const GW::PathingTrapezoid* first)
+    {
+        using Portal = std::pair<GW::Vec2f, GW::Vec2f>;
+        std::vector<Portal> portals{{{start.x, start.y}, {start.x, start.y}}};
+        const auto* previous = first;
+        for (const auto* trap : corridor) {
+            portals.push_back(TransitionPortal(previous, trap));
+            previous = trap;
+        }
+        portals.push_back({{finish.x, finish.y}, {finish.x, finish.y}});
+        const auto area = [](const GW::Vec2f& a, const GW::Vec2f& b, const GW::Vec2f& c) {
+            return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        };
+        const auto equal = [](const GW::Vec2f& a, const GW::Vec2f& b) {
+            const float dx = a.x - b.x, dy = a.y - b.y;
+            return dx * dx + dy * dy < 1.f;
+        };
+        std::vector<GW::GamePos> pulled{start};
+        GW::Vec2f apex = portals[0].first, left = apex, right = apex;
+        size_t apex_index = 0, left_index = 0, right_index = 0;
+        for (size_t i = 1; i < portals.size(); i++) {
+            const auto new_left = portals[i].first, new_right = portals[i].second;
+            if (area(apex, right, new_right) <= 0.f) {
+                if (equal(apex, right) || area(apex, left, new_right) > 0.f) {
+                    right = new_right;
+                    right_index = i;
+                }
+                else {
+                    pulled.push_back({left.x, left.y, 0});
+                    apex = left;
+                    apex_index = left_index;
+                    left = right = apex;
+                    left_index = right_index = apex_index;
+                    i = apex_index;
+                    continue;
+                }
+            }
+            if (area(apex, left, new_left) >= 0.f) {
+                if (equal(apex, left) || area(apex, right, new_left) < 0.f) {
+                    left = new_left;
+                    left_index = i;
+                }
+                else {
+                    pulled.push_back({right.x, right.y, 0});
+                    apex = right;
+                    apex_index = right_index;
+                    left = right = apex;
+                    left_index = right_index = apex_index;
+                    i = apex_index;
+                }
+            }
+        }
+        if (!equal({pulled.back().x, pulled.back().y}, {finish.x, finish.y})) pulled.push_back(finish);
+        return pulled;
     }
 
     size_t ClipHalfPlane(GW::Vec2f (&poly)[8], const size_t count, const int axis,
@@ -551,8 +635,8 @@ namespace {
     void BuildRoute()
     {
         const int quality = std::clamp(optimization_quality, 0, 2);
-        const int two_opt_passes = std::array{8, 16, 32}[quality];
-        const int relocation_passes = std::array{2, 6, 12}[quality];
+        const int two_opt_passes = std::array{8, 16, 24}[quality];
+        const int relocation_passes = std::array{4, 8, 16}[quality];
         route.clear();
         route_waypoints.clear();
         route_waypoint_reveals.clear();
@@ -940,10 +1024,9 @@ namespace {
         // its neighbours in the finished sweep. A cell can overlap several
         // disconnected-looking corridor edges; choosing by area alone creates
         // avoidable trips into the far side of that cell.
-        for (int pass = 0; pass < relaxation_passes; pass++) {
+        for (int pass = 0; pass < std::min(relaxation_passes, 6); pass++) {
             bool improved = false;
-            for (size_t iteration = 0; iteration < order.size(); iteration++) {
-                const size_t position = pass % 2 ? order.size() - 1 - iteration : iteration;
+            for (size_t position = 0; position < order.size(); position++) {
                 Candidate& current = candidates[selected[order[position]]];
                 const auto options = footing_options.find({current.cell_x, current.cell_y});
                 if (options == footing_options.end() || options->second.size() < 2) continue;
@@ -959,10 +1042,6 @@ namespace {
                 const auto score = [&](const Candidate& option) {
                     float value = connection_cost(previous_trap, previous_point, option.trap, option.pos);
                     if (has_next) value += connection_cost(option.trap, option.pos, next_trap, next_point);
-                    if (has_next) {
-                        value += sqrtf(DistanceToSegmentSq({option.pos.x, option.pos.y},
-                            {previous_point.x, previous_point.y}, {next_point.x, next_point.y})) * .75f;
-                    }
                     return value;
                 };
                 float best_score = score(current);
@@ -985,10 +1064,10 @@ namespace {
         // covered fog cell, minimizing the two neighbouring navmesh legs. This lets
         // a slightly angled through-route collect a square instead of making a
         // perpendicular visit and returning to the same corridor.
+        const auto morph_options = candidates;
         for (int pass = 0; pass < relaxation_passes; pass++) {
             bool improved = false;
-            for (size_t iteration = 0; iteration < order.size(); iteration++) {
-                const size_t position = pass % 2 ? order.size() - 1 - iteration : iteration;
+            for (size_t position = 0; position < order.size(); position++) {
                 Candidate& current = candidates[selected[order[position]]];
                 for (const uint32_t fog : current.reveals) cover_count[fog]--;
                 std::vector<uint32_t> required;
@@ -1007,20 +1086,11 @@ namespace {
                 const auto score = [&](const Candidate& option) {
                     float value = connection_cost(previous_trap, previous_point, option.trap, option.pos);
                     if (has_next) value += connection_cost(option.trap, option.pos, next_trap, next_point);
-                    if (has_next) {
-                        value += sqrtf(DistanceToSegmentSq({option.pos.x, option.pos.y},
-                            {previous_point.x, previous_point.y}, {next_point.x, next_point.y})) * .75f;
-                    }
                     return value;
                 };
                 float best_score = score(current);
                 const Candidate* best = &current;
-                const auto local_options = footing_options.find({current.cell_x, current.cell_y});
-                if (local_options == footing_options.end()) {
-                    for (const uint32_t fog : current.reveals) cover_count[fog]++;
-                    continue;
-                }
-                for (const Candidate& option : local_options->second) {
+                for (const Candidate& option : morph_options) {
                     const bool preserves_coverage = std::ranges::all_of(required, [&](const uint32_t fog) {
                         return std::ranges::find(option.reveals, fog) != option.reveals.end();
                     });
@@ -1100,7 +1170,7 @@ namespace {
             for (int restart = 0; restart < randomized_restarts; restart++) {
                 auto trial = order;
                 std::shuffle(trial.begin(), trial.end(), rng);
-                for (int pass = 0; pass < two_opt_passes / 2; pass++) {
+                for (int pass = 0; pass < 8; pass++) {
                     bool improved = false;
                     for (size_t i = 0; i + 1 < trial.size(); i++) {
                         const size_t before = i ? trial[i - 1] : target_count;
@@ -1116,7 +1186,7 @@ namespace {
                     }
                     if (!improved) break;
                 }
-                for (int pass = 0; pass < relocation_passes / 2; pass++) {
+                for (int pass = 0; pass < 2; pass++) {
                     bool improved = false;
                     float trial_cost = order_cost(trial);
                     for (size_t from_index = 0; from_index < trial.size(); from_index++) {
@@ -1277,6 +1347,28 @@ namespace {
             return;
         }
         route.push_back(player->pos);
+        std::vector<bool> route_fixed{true};
+        const auto segment_is_safe = [&](const GW::Vec2f& a, const GW::Vec2f& b) {
+            if (std::ranges::any_of(path_doorways, [&](const Doorway& door) {
+                return DistanceToSegmentSq(door.pos, a, b) < door.radius_sq;
+            })) return false;
+            const float dx = b.x - a.x, dy = b.y - a.y;
+            const int samples = std::max(1, static_cast<int>(ceilf(hypotf(dx, dy) / 90.f)));
+            for (int sample = 1; sample < samples; sample++) {
+                const float t = static_cast<float>(sample) / static_cast<float>(samples);
+                const GW::Vec2f point{a.x + dx * t, a.y + dy * t};
+                bool inside = false;
+                for (const auto& pathing_map : *maps) {
+                    for (uint32_t trap_index = 0; trap_index < pathing_map.trapezoid_count; trap_index++) {
+                        const auto* trap = &pathing_map.trapezoids[trap_index];
+                        if (reachable.contains(trap) && Contains(trap, point)) { inside = true; break; }
+                    }
+                    if (inside) break;
+                }
+                if (!inside) return false;
+            }
+            return true;
+        };
         for (const size_t ordered_index : order) {
             const Candidate* target = &candidates[selected[ordered_index]];
             const auto leg = find_leg(from, target->trap, &route.back());
@@ -1304,8 +1396,50 @@ namespace {
             }
             raw.push_back(target->pos);
 
-            route.insert(route.end(), raw.begin() + 1, raw.end());
+            const auto shortcut_is_safe = [&](const size_t begin, const size_t end) {
+                return segment_is_safe({raw[begin].x, raw[begin].y}, {raw[end].x, raw[end].y});
+            };
+
+            size_t at = 0;
+            while (at + 1 < raw.size()) {
+                size_t next = at + 1;
+                const size_t furthest = std::min(raw.size() - 1, at + 96);
+                for (size_t candidate = furthest; candidate > at + 1; candidate--) {
+                    if (shortcut_is_safe(at, candidate)) { next = candidate; break; }
+                }
+                route.push_back(raw[next]);
+                route_fixed.push_back(next + 1 == raw.size());
+                at = next;
+            }
             from = target->trap;
+        }
+        for (int pass = 0; pass < 24; pass++) {
+            bool moved = false;
+            for (size_t i = 1; i + 1 < route.size(); i++) {
+                if (route_fixed[i]) continue;
+                const GW::Vec2f current{route[i].x, route[i].y};
+                const GW::Vec2f midpoint{(route[i - 1].x + route[i + 1].x) * .5f,
+                                         (route[i - 1].y + route[i + 1].y) * .5f};
+                for (float alpha : {1.f, .75f, .5f, .25f}) {
+                    const GW::Vec2f candidate{current.x + (midpoint.x - current.x) * alpha,
+                                              current.y + (midpoint.y - current.y) * alpha};
+                    if (!segment_is_safe({route[i - 1].x, route[i - 1].y}, candidate)
+                        || !segment_is_safe(candidate, {route[i + 1].x, route[i + 1].y})) continue;
+                    route[i].x = candidate.x;
+                    route[i].y = candidate.y;
+                    moved = true;
+                    break;
+                }
+            }
+            if (!moved) break;
+        }
+        for (size_t i = route.size(); i-- > 2;) {
+            const size_t middle = i - 1;
+            if (route_fixed[middle]) continue;
+            if (!segment_is_safe({route[middle - 1].x, route[middle - 1].y},
+                                 {route[middle + 1].x, route[middle + 1].y})) continue;
+            route.erase(route.begin() + static_cast<ptrdiff_t>(middle));
+            route_fixed.erase(route_fixed.begin() + static_cast<ptrdiff_t>(middle));
         }
         route_connected = !route_waypoints.empty();
         for (size_t i = 1; i < route.size(); i++)
@@ -1657,8 +1791,8 @@ void WorldCompletionPlugin::LoadSettings(const wchar_t* folder)
     LoadSetting("randomized_restarts", randomized_restarts);
     arrow_size_percent = std::clamp(arrow_size_percent, 10, 250);
     optimization_quality = std::clamp(optimization_quality, 0, 2);
-    relaxation_passes = std::clamp(relaxation_passes, 0, 24);
-    randomized_restarts = std::clamp(randomized_restarts, 0, 32);
+    relaxation_passes = std::clamp(relaxation_passes, 0, 8);
+    randomized_restarts = std::clamp(randomized_restarts, 0, 12);
 }
 
 void WorldCompletionPlugin::SaveSettings(const wchar_t* folder)
@@ -1806,8 +1940,8 @@ void WorldCompletionPlugin::DrawSettings()
     const char* quality_names[] = {"Fast", "Balanced", "Thorough"};
     bool optimization_changed = ImGui::Combo("Optimization quality", &optimization_quality,
                                              quality_names, IM_ARRAYSIZE(quality_names));
-    optimization_changed |= ImGui::SliderInt("Relaxation passes", &relaxation_passes, 0, 24);
-    optimization_changed |= ImGui::SliderInt("Randomized restarts", &randomized_restarts, 0, 32);
+    optimization_changed |= ImGui::SliderInt("Relaxation passes", &relaxation_passes, 0, 8);
+    optimization_changed |= ImGui::SliderInt("Randomized restarts", &randomized_restarts, 0, 12);
     if (optimization_changed) recompute_requested.store(true, std::memory_order_release);
 }
 

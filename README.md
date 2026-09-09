@@ -40,11 +40,11 @@ Then configure GWToolbox++ normally and build the `WorldCompletion` target. The 
 
 The plugin reads Guild Wars' live cartography bitfield and pathing trapezoids through GWCA. It maps unexplored fog cells to reachable standing candidates, favors candidates that reveal multiple required cells, and reduces redundant stops while preserving coverage.
 
-Route construction uses the game's pathing-plane and portal connectivity. A bounded shortest-path search creates traversable legs between selected stops. The visit order is refined with open-path 2-opt and relocation passes. Alternating forward and reverse relaxation sweeps choose only local footing alternatives for the same cartography cell. Their objective combines adjacent-leg distance with lateral deviation from the neighboring-stop chord, so additional passes converge toward straighter placements instead of drifting between distant reveal candidates. The settings control the pass budget and randomized search breadth.
+Route construction uses the game's pathing-plane and portal connectivity. A bounded shortest-path search creates traversable legs between selected stops. The visit order is refined with the original forward-only open-path 2-opt, relocation, footing, and coverage-preserving morph passes. Settings adjust only their bounded iteration budgets; the maximum values reproduce the original behavior.
 
 Progress is constrained to the current unfinished target rather than chosen globally from the nearest route geometry. This prevents crossings and shared road sections from skipping later targets. The ground route samples terrain altitude and renders contiguous chevrons with independently interpolated Z intervals. With occlusion enabled, those triangles are depth-tested against the game scene.
 
-Final route geometry retains the ordered transitions between adjacent pathing trapezoids. Optimization is limited to stop selection and ordering, so recomputation—manual or automatic—cannot replace a graph-valid leg with a straight XY shortcut across separate terrain surfaces.
+Final route geometry uses the original transition expansion, validated shortcut selection, and elastic corner smoothing pipeline. The later alternating relaxation, forced portal-midpoint chain, and experimental corridor funnel were rolled back after they caused zigzags or invalid terrain crossings.
 
 Expensive search stages use user-bounded iteration counts and cached geometry. Route computation is triggered by meaningful map/cartography changes or the recompute button rather than every frame. Travel, map-change, and map-loaded messages suspend the route and release Direct3D state before map-owned resources change.
 
