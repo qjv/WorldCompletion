@@ -80,6 +80,12 @@ namespace {
     GW::Constants::InstanceType pending_instance = GW::Constants::InstanceType::Loading;
     std::atomic_bool route_suspended = true;
     std::atomic_bool transition_event = false;
+    std::atomic_bool recompute_requested = false;
+    int arrow_size_percent = 100;
+    uint32_t route_colour = IM_COL32(255, 145, 35, 245);
+    int optimization_quality = 1;
+    int relaxation_passes = 8;
+    int randomized_restarts = 12;
     uint32_t resume_after = 0;
     uint32_t last_rebuild = 0;
     uint32_t last_fog_check = 0;
@@ -101,6 +107,7 @@ namespace {
     std::vector<GroundVertex> ground_core_vertices;
     float cached_ground_thickness = -1.f;
     float cached_ground_arrow_size = -1.f;
+    uint32_t cached_ground_colour = 0;
     bool ground_vertices_dirty = true;
     size_t route_progress = 0;
     size_t ground_progress = 0;
@@ -543,6 +550,9 @@ namespace {
 
     void BuildRoute()
     {
+        const int quality = std::clamp(optimization_quality, 0, 2);
+        const int two_opt_passes = std::array{8, 16, 32}[quality];
+        const int relocation_passes = std::array{2, 6, 12}[quality];
         route.clear();
         route_waypoints.clear();
         route_waypoint_reveals.clear();
@@ -873,7 +883,7 @@ namespace {
         }
 
         // Remove graph-distance backtracks with repeated open-path 2-opt passes.
-        for (int pass = 0; pass < 24; pass++) {
+        for (int pass = 0; pass < two_opt_passes; pass++) {
             bool improved = false;
             for (size_t i = 0; i + 1 < order.size(); i++) {
                 const size_t before = i ? order[i - 1] : target_count;
@@ -904,7 +914,7 @@ namespace {
         };
         if (order.size() <= 128) {
             float best_cost = order_cost(order);
-            for (int pass = 0; pass < 16; pass++) {
+            for (int pass = 0; pass < relocation_passes; pass++) {
                 std::vector<size_t> best_order = order;
                 float pass_cost = best_cost;
                 for (size_t from_index = 0; from_index < order.size(); from_index++) {
@@ -930,9 +940,10 @@ namespace {
         // its neighbours in the finished sweep. A cell can overlap several
         // disconnected-looking corridor edges; choosing by area alone creates
         // avoidable trips into the far side of that cell.
-        for (int pass = 0; pass < 6; pass++) {
+        for (int pass = 0; pass < relaxation_passes; pass++) {
             bool improved = false;
-            for (size_t position = 0; position < order.size(); position++) {
+            for (size_t iteration = 0; iteration < order.size(); iteration++) {
+                const size_t position = pass % 2 ? order.size() - 1 - iteration : iteration;
                 Candidate& current = candidates[selected[order[position]]];
                 const auto options = footing_options.find({current.cell_x, current.cell_y});
                 if (options == footing_options.end() || options->second.size() < 2) continue;
@@ -971,9 +982,10 @@ namespace {
         // a slightly angled through-route collect a square instead of making a
         // perpendicular visit and returning to the same corridor.
         const auto morph_options = candidates;
-        for (int pass = 0; pass < 8; pass++) {
+        for (int pass = 0; pass < relaxation_passes; pass++) {
             bool improved = false;
-            for (size_t position = 0; position < order.size(); position++) {
+            for (size_t iteration = 0; iteration < order.size(); iteration++) {
+                const size_t position = pass % 2 ? order.size() - 1 - iteration : iteration;
                 Candidate& current = candidates[selected[order[position]]];
                 for (const uint32_t fog : current.reveals) cover_count[fog]--;
                 std::vector<uint32_t> required;
@@ -1026,7 +1038,7 @@ namespace {
                 costs[i][j] = costs[j][i] = cost;
             }
         }
-        for (int pass = 0; pass < 24; pass++) {
+        for (int pass = 0; pass < two_opt_passes; pass++) {
             bool improved = false;
             for (size_t i = 0; i + 1 < order.size(); i++) {
                 const size_t before = i ? order[i - 1] : target_count;
@@ -1044,7 +1056,7 @@ namespace {
         }
         if (order.size() <= 128) {
             float best_cost = order_cost(order);
-            for (int pass = 0; pass < 16; pass++) {
+            for (int pass = 0; pass < relocation_passes; pass++) {
                 std::vector<size_t> best_order = order;
                 float pass_cost = best_cost;
                 for (size_t from_index = 0; from_index < order.size(); from_index++) {
@@ -1073,10 +1085,10 @@ namespace {
             std::vector<size_t> global_best = order;
             float global_best_cost = order_cost(global_best);
             std::mt19937 rng(0x57435254u ^ static_cast<uint32_t>(route_map));
-            for (int restart = 0; restart < 12; restart++) {
+            for (int restart = 0; restart < randomized_restarts; restart++) {
                 auto trial = order;
                 std::shuffle(trial.begin(), trial.end(), rng);
-                for (int pass = 0; pass < 8; pass++) {
+                for (int pass = 0; pass < two_opt_passes / 2; pass++) {
                     bool improved = false;
                     for (size_t i = 0; i + 1 < trial.size(); i++) {
                         const size_t before = i ? trial[i - 1] : target_count;
@@ -1092,7 +1104,7 @@ namespace {
                     }
                     if (!improved) break;
                 }
-                for (int pass = 0; pass < 2; pass++) {
+                for (int pass = 0; pass < relocation_passes / 2; pass++) {
                     bool improved = false;
                     float trial_cost = order_cost(trial);
                     for (size_t from_index = 0; from_index < trial.size(); from_index++) {
@@ -1214,7 +1226,7 @@ namespace {
         }
 
         const auto improve = [&](std::vector<size_t>& candidate_order) {
-            for (int pass = 0; pass < 16; pass++) {
+            for (int pass = 0; pass < two_opt_passes; pass++) {
                 bool improved = false;
                 for (size_t i = 0; i + 1 < candidate_order.size(); i++) {
                     const size_t before = i ? candidate_order[i - 1] : target_count;
@@ -1253,28 +1265,6 @@ namespace {
             return;
         }
         route.push_back(player->pos);
-        std::vector<bool> route_fixed{true};
-        const auto segment_is_safe = [&](const GW::Vec2f& a, const GW::Vec2f& b) {
-            if (std::ranges::any_of(path_doorways, [&](const Doorway& door) {
-                return DistanceToSegmentSq(door.pos, a, b) < door.radius_sq;
-            })) return false;
-            const float dx = b.x - a.x, dy = b.y - a.y;
-            const int samples = std::max(1, static_cast<int>(ceilf(hypotf(dx, dy) / 90.f)));
-            for (int sample = 1; sample < samples; sample++) {
-                const float t = static_cast<float>(sample) / static_cast<float>(samples);
-                const GW::Vec2f point{a.x + dx * t, a.y + dy * t};
-                bool inside = false;
-                for (const auto& pathing_map : *maps) {
-                    for (uint32_t trap_index = 0; trap_index < pathing_map.trapezoid_count; trap_index++) {
-                        const auto* trap = &pathing_map.trapezoids[trap_index];
-                        if (reachable.contains(trap) && Contains(trap, point)) { inside = true; break; }
-                    }
-                    if (inside) break;
-                }
-                if (!inside) return false;
-            }
-            return true;
-        };
         for (const size_t ordered_index : order) {
             const Candidate* target = &candidates[selected[ordered_index]];
             const auto leg = find_leg(from, target->trap, &route.back());
@@ -1302,53 +1292,8 @@ namespace {
             }
             raw.push_back(target->pos);
 
-            const auto shortcut_is_safe = [&](const size_t begin, const size_t end) {
-                return segment_is_safe({raw[begin].x, raw[begin].y}, {raw[end].x, raw[end].y});
-            };
-
-            size_t at = 0;
-            while (at + 1 < raw.size()) {
-                size_t next = at + 1;
-                const size_t furthest = std::min(raw.size() - 1, at + 96);
-                for (size_t candidate = furthest; candidate > at + 1; candidate--) {
-                    if (shortcut_is_safe(at, candidate)) { next = candidate; break; }
-                }
-                route.push_back(raw[next]);
-                route_fixed.push_back(next + 1 == raw.size());
-                at = next;
-            }
+            route.insert(route.end(), raw.begin() + 1, raw.end());
             from = target->trap;
-        }
-        // Pull non-discovery corners toward the straight chord. This is a
-        // lightweight elastic funnel: points stop at the first terrain boundary,
-        // producing tangent-like corners instead of portal-centre arcs.
-        for (int pass = 0; pass < 24; pass++) {
-            bool moved = false;
-            for (size_t i = 1; i + 1 < route.size(); i++) {
-                if (route_fixed[i]) continue;
-                const GW::Vec2f current{route[i].x, route[i].y};
-                const GW::Vec2f midpoint{(route[i - 1].x + route[i + 1].x) * .5f,
-                                         (route[i - 1].y + route[i + 1].y) * .5f};
-                for (float alpha : {1.f, .75f, .5f, .25f}) {
-                    const GW::Vec2f candidate{current.x + (midpoint.x - current.x) * alpha,
-                                              current.y + (midpoint.y - current.y) * alpha};
-                    if (!segment_is_safe({route[i - 1].x, route[i - 1].y}, candidate)
-                        || !segment_is_safe(candidate, {route[i + 1].x, route[i + 1].y})) continue;
-                    route[i].x = candidate.x;
-                    route[i].y = candidate.y;
-                    moved = true;
-                    break;
-                }
-            }
-            if (!moved) break;
-        }
-        for (size_t i = route.size(); i-- > 2;) {
-            const size_t middle = i - 1;
-            if (route_fixed[middle]) continue;
-            if (!segment_is_safe({route[middle - 1].x, route[middle - 1].y},
-                                 {route[middle + 1].x, route[middle + 1].y})) continue;
-            route.erase(route.begin() + static_cast<ptrdiff_t>(middle));
-            route_fixed.erase(route_fixed.begin() + static_cast<ptrdiff_t>(middle));
         }
         route_connected = !route_waypoints.empty();
         for (size_t i = 1; i < route.size(); i++)
@@ -1428,7 +1373,7 @@ namespace {
 
         auto* draw = ImGui::GetBackgroundDrawList();
         const ImU32 shadow = IM_COL32(35, 12, 0, 190);
-        const ImU32 orange = IM_COL32(255, 145, 35, 245);
+        const ImU32 orange = route_colour;
         const auto* player = GW::Agents::GetControlledCharacter();
         if (!player) return;
         const size_t first = ClosestGroundPoint({player->pos.x, player->pos.y});
@@ -1521,11 +1466,17 @@ namespace {
             }
         };
         const float core_width = std::clamp(thickness * 3.f, 6.f, 18.f);
-        if (ground_vertices_dirty || cached_ground_thickness != thickness || cached_ground_arrow_size != arrow_scale) {
+        if (ground_vertices_dirty || cached_ground_thickness != thickness || cached_ground_arrow_size != arrow_scale
+            || cached_ground_colour != route_colour) {
+            const auto alpha = static_cast<uint8_t>(route_colour >> 24);
+            const auto blue = static_cast<uint8_t>(route_colour >> 16);
+            const auto green = static_cast<uint8_t>(route_colour >> 8);
+            const auto red = static_cast<uint8_t>(route_colour);
             build_ribbon(ground_border_vertices, core_width + 5.f, D3DCOLOR_ARGB(220, 35, 12, 0));
-            build_ribbon(ground_core_vertices, core_width, D3DCOLOR_ARGB(255, 255, 184, 48));
+            build_ribbon(ground_core_vertices, core_width, D3DCOLOR_ARGB(alpha, red, green, blue));
             cached_ground_thickness = thickness;
             cached_ground_arrow_size = arrow_scale;
+            cached_ground_colour = route_colour;
             ground_vertices_dirty = false;
         }
         if (ground_core_vertices.empty()) return false;
@@ -1656,6 +1607,8 @@ void WorldCompletionPlugin::SignalTerminate()
     // Overlay/path callbacks will be removed here once the host bridge is
     // added. Keeping the lifecycle hook in place prevents teardown leaks.
     GW::UI::RemoveUIMessageCallback(&map_lifecycle_hook);
+    recompute_requested.store(false, std::memory_order_release);
+    if (!settings_folder_.empty()) SaveSettings(settings_folder_.c_str());
     ToolboxUIPlugin::SignalTerminate();
     debug_log.close();
     if (route_state_block) {
@@ -1667,6 +1620,7 @@ void WorldCompletionPlugin::SignalTerminate()
 
 void WorldCompletionPlugin::LoadSettings(const wchar_t* folder)
 {
+    settings_folder_ = folder ? folder : L"";
     ToolboxUIPlugin::LoadSettings(folder);
     debug_log.close();
     last_log_summary.clear();
@@ -1683,18 +1637,31 @@ void WorldCompletionPlugin::LoadSettings(const wchar_t* folder)
     LoadSetting("occlude_ground_route", occlude_ground_route_);
     LoadSetting("show_numbers", show_numbers_);
     LoadSetting("route_thickness", route_thickness_);
-    LoadSetting("arrow_size", arrow_size_);
+    LoadSetting("arrow_size_percent", arrow_size_percent);
+    LoadSetting("route_colour", route_colour);
+    LoadSetting("optimization_quality", optimization_quality);
+    LoadSetting("relaxation_passes", relaxation_passes);
+    LoadSetting("randomized_restarts", randomized_restarts);
+    arrow_size_percent = std::clamp(arrow_size_percent, 10, 250);
+    optimization_quality = std::clamp(optimization_quality, 0, 2);
+    relaxation_passes = std::clamp(relaxation_passes, 0, 24);
+    randomized_restarts = std::clamp(randomized_restarts, 0, 32);
 }
 
 void WorldCompletionPlugin::SaveSettings(const wchar_t* folder)
 {
+    if (folder) settings_folder_ = folder;
     SaveSetting("show_debug_status", show_debug_status_);
     SaveSetting("show_route", show_route_);
     SaveSetting("show_ground_route", show_ground_route_);
     SaveSetting("occlude_ground_route", occlude_ground_route_);
     SaveSetting("show_numbers", show_numbers_);
     SaveSetting("route_thickness", route_thickness_);
-    SaveSetting("arrow_size", arrow_size_);
+    SaveSetting("arrow_size_percent", arrow_size_percent);
+    SaveSetting("route_colour", route_colour);
+    SaveSetting("optimization_quality", optimization_quality);
+    SaveSetting("relaxation_passes", relaxation_passes);
+    SaveSetting("randomized_restarts", randomized_restarts);
     ToolboxUIPlugin::SaveSettings(folder);
 }
 
@@ -1798,7 +1765,8 @@ void WorldCompletionPlugin::Update(const float)
         if (ground_route.size() > 1) ground_progress = ClosestGroundPoint({player->pos.x, player->pos.y});
     }
     const bool transient_retry = route.empty() && now - last_rebuild >= 3000;
-    if (unexpected_discovery || transient_retry) {
+    const bool manual_recompute = recompute_requested.exchange(false, std::memory_order_acq_rel);
+    if (unexpected_discovery || transient_retry || manual_recompute) {
         last_rebuild = now;
         BuildRoute();
         if (const auto* world = GW::GetWorldContext(); world && world->cartographed_areas.valid()) {
@@ -1816,7 +1784,18 @@ void WorldCompletionPlugin::DrawSettings()
     ImGui::Checkbox("Occlude ground route", &occlude_ground_route_);
     ImGui::Checkbox("Show waypoint numbers", &show_numbers_);
     ImGui::SliderFloat("Route thickness", &route_thickness_, 1.f, 6.f, "%.1f px");
-    ImGui::SliderFloat("Arrow size", &arrow_size_, .5f, 2.5f, "%.1fx");
+    ImGui::SliderInt("Arrow size", &arrow_size_percent, 10, 250, "%d%%");
+    ImVec4 colour = ImGui::ColorConvertU32ToFloat4(route_colour);
+    if (ImGui::ColorEdit4("Route color", &colour.x, ImGuiColorEditFlags_AlphaBar)) {
+        route_colour = ImGui::ColorConvertFloat4ToU32(colour);
+        ground_vertices_dirty = true;
+    }
+    const char* quality_names[] = {"Fast", "Balanced", "Thorough"};
+    bool optimization_changed = ImGui::Combo("Optimization quality", &optimization_quality,
+                                             quality_names, IM_ARRAYSIZE(quality_names));
+    optimization_changed |= ImGui::SliderInt("Relaxation passes", &relaxation_passes, 0, 24);
+    optimization_changed |= ImGui::SliderInt("Randomized restarts", &randomized_restarts, 0, 32);
+    if (optimization_changed) recompute_requested.store(true, std::memory_order_release);
 }
 
 void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
@@ -1824,15 +1803,17 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
     if (route_suspended || !IsLoadedContext() || route_map != GW::Map::GetMapID()
         || route_instance != GW::Map::GetInstanceType()) return;
 
+    const float arrow_scale = static_cast<float>(arrow_size_percent) / 100.f;
     if (show_ground_route_ && current_instance_ == GW::Constants::InstanceType::Explorable) {
-        if (!occlude_ground_route_ || !DrawOccludedGroundRoute(device, route_thickness_, arrow_size_)) DrawGroundRoute(arrow_size_);
+        if (!occlude_ground_route_ || !DrawOccludedGroundRoute(device, route_thickness_, arrow_scale)) DrawGroundRoute(arrow_scale);
     }
 
     ImRect mission_clip;
     ImVec2 mission_point;
     if (ProjectMissionMap({}, mission_point, mission_clip)) {
         constexpr float button_size = 30.f;
-        ImGui::SetNextWindowPos({mission_clip.Max.x - button_size - 7.f,
+        constexpr float button_gap = 4.f;
+        ImGui::SetNextWindowPos({mission_clip.Max.x - button_size * 2.f - button_gap - 7.f,
                                  mission_clip.Max.y - button_size - 7.f});
         ImGui::SetNextWindowBgAlpha(0.f);
         constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
@@ -1846,7 +1827,7 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
             auto* button_draw = ImGui::GetWindowDrawList();
             button_draw->AddRectFilled(min, max, hovered ? IM_COL32(239, 246, 248, 255) : IM_COL32(213, 226, 230, 245), 5.f);
             button_draw->AddRect(min, max, IM_COL32(20, 42, 50, 255), 5.f, 0, 2.f);
-            const ImU32 icon_colour = show_route_ ? IM_COL32(255, 145, 35, 255) : IM_COL32(75, 91, 98, 255);
+            const ImU32 icon_colour = show_route_ ? route_colour : IM_COL32(75, 91, 98, 255);
             const ImVec2 p0{min.x + 6.f, max.y - 7.f};
             const ImVec2 p1{min.x + 11.f, min.y + 10.f};
             const ImVec2 p2{min.x + 17.f, min.y + 17.f};
@@ -1857,6 +1838,20 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
             button_draw->AddCircleFilled(p0, 2.2f, icon_colour);
             button_draw->AddCircleFilled(p3, 2.2f, icon_colour);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle the world-completion route on this map");
+            ImGui::SameLine(0.f, button_gap);
+            if (ImGui::InvisibleButton("##recompute", {button_size, button_size})) recompute_requested.store(true, std::memory_order_release);
+            const bool refresh_hovered = ImGui::IsItemHovered();
+            const ImVec2 refresh_min = ImGui::GetItemRectMin();
+            const ImVec2 refresh_max = ImGui::GetItemRectMax();
+            button_draw->AddRectFilled(refresh_min, refresh_max,
+                                       refresh_hovered ? IM_COL32(239, 246, 248, 255) : IM_COL32(213, 226, 230, 245), 5.f);
+            button_draw->AddRect(refresh_min, refresh_max, IM_COL32(20, 42, 50, 255), 5.f, 0, 2.f);
+            const ImVec2 center{(refresh_min.x + refresh_max.x) * .5f, (refresh_min.y + refresh_max.y) * .5f};
+            button_draw->PathArcTo(center, 8.f, -2.8f, .5f, 16);
+            button_draw->PathStroke(route_colour, 0, 2.5f);
+            button_draw->AddTriangleFilled({center.x + 8.f, center.y - 4.f}, {center.x + 11.f, center.y + 2.f},
+                                           {center.x + 4.f, center.y + 1.f}, route_colour);
+            if (refresh_hovered) ImGui::SetTooltip("Recompute the world-completion route");
         }
         ImGui::End();
         ImGui::PopStyleVar();
@@ -1874,7 +1869,7 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
             if (!world_surface) world_surface = ProjectMissionMap(first_wm, previous, clip);
             if (world_surface) {
                 dl->PushClipRect(clip.Min, clip.Max, true);
-                const ImU32 colour = IM_COL32(255, 145, 35, 235);
+                const ImU32 colour = route_colour;
                 for (size_t i = first_route_point; i < route.size(); i++) {
                     GW::Vec2f wm;
                     ImVec2 screen;
@@ -1888,7 +1883,7 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
                     if (length > 7.f) {
                         const float ux = dx / length, uy = dy / length;
                         const float px = -uy, py = ux;
-                        const float arrow_size = std::clamp(route_thickness_ * 3.f, 7.f, 14.f) * arrow_size_;
+                        const float arrow_size = std::clamp(route_thickness_ * 3.f, 7.f, 14.f) * arrow_scale;
                         for (float start = 0.f; start < length; start += arrow_size) {
                             const float end = std::min(start + arrow_size, length);
                             if (end - start < arrow_size * .35f) break;

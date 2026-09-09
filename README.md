@@ -7,10 +7,14 @@ WorldCompletion is an experimental [GWToolbox++](https://github.com/gwdevhub/GWT
 - Recomputes the route as cartography progress changes.
 - Keeps route progress monotonic through intersections and overlapping roads.
 - Draws adjustable, end-to-end directional arrows instead of ambiguous lines.
+- Provides arrow sizing from 10% to 250% and a configurable route color.
 - Provides optional depth-tested ground rendering so terrain can occlude arrows.
+- Includes adjacent minimap controls for visibility and explicit recomputation.
 - Marks narrow mandatory stops and omits completed reveal targets.
 - Suspends route state during travel and map transitions.
 - Uses bounded optimization passes to avoid long loading stalls.
+- Exposes fast, balanced, and thorough optimization modes, relaxation passes, and randomized restart counts.
+- Saves appearance and optimizer settings explicitly when the plugin unloads.
 
 ## Installation
 
@@ -36,11 +40,13 @@ Then configure GWToolbox++ normally and build the `WorldCompletion` target. The 
 
 The plugin reads Guild Wars' live cartography bitfield and pathing trapezoids through GWCA. It maps unexplored fog cells to reachable standing candidates, favors candidates that reveal multiple required cells, and reduces redundant stops while preserving coverage.
 
-Route construction uses the game's pathing-plane and portal connectivity. A bounded shortest-path search creates traversable legs between selected stops. The visit order is refined with open-path 2-opt and relocation passes. Additional elastic morphing moves stops among equivalent reveal candidates when that shortens adjacent legs without losing uniquely covered cartography cells.
+Route construction uses the game's pathing-plane and portal connectivity. A bounded shortest-path search creates traversable legs between selected stops. The visit order is refined with open-path 2-opt and relocation passes. Alternating forward and reverse relaxation sweeps move stops among equivalent reveal candidates when that shortens adjacent legs without losing uniquely covered cartography cells. The settings control the pass budget and randomized search breadth.
 
 Progress is constrained to the current unfinished target rather than chosen globally from the nearest route geometry. This prevents crossings and shared road sections from skipping later targets. The ground route samples terrain altitude and renders contiguous chevrons with independently interpolated Z intervals. With occlusion enabled, those triangles are depth-tested against the game scene.
 
-Expensive search stages use fixed iteration bounds and cached geometry. Route computation is triggered by meaningful map/cartography changes rather than every frame. Travel, map-change, and map-loaded messages suspend the route and release Direct3D state before map-owned resources change.
+Final route geometry retains the ordered transitions between adjacent pathing trapezoids. Optimization is limited to stop selection and ordering, so recomputation—manual or automatic—cannot replace a graph-valid leg with a straight XY shortcut across separate terrain surfaces.
+
+Expensive search stages use user-bounded iteration counts and cached geometry. Route computation is triggered by meaningful map/cartography changes or the recompute button rather than every frame. Travel, map-change, and map-loaded messages suspend the route and release Direct3D state before map-owned resources change.
 
 ## Credits
 

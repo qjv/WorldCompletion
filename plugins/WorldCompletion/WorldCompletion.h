@@ -31,5 +31,5 @@ private:
     bool occlude_ground_route_ = true;
     bool show_numbers_ = true;
     float route_thickness_ = 2.5f;
-    float arrow_size_ = 1.f;
+    std::wstring settings_folder_;
 };
