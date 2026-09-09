@@ -6,7 +6,7 @@ WorldCompletion is an experimental [GWToolbox++](https://github.com/gwdevhub/GWT
 
 - Recomputes the route as cartography progress changes.
 - Keeps route progress monotonic through intersections and overlapping roads.
-- Draws adjustable, end-to-end directional arrows instead of ambiguous lines.
+- Draws a gap-free minimap line plus adjustable, end-to-end directional arrows on the world map and terrain.
 - Provides arrow sizing from 10% to 250% and a configurable route color.
 - Provides optional depth-tested ground rendering so terrain can occlude arrows.
 - Includes adjacent minimap controls for visibility and explicit recomputation.

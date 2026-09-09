@@ -82,7 +82,7 @@ namespace {
     std::atomic_bool transition_event = false;
     std::atomic_bool recompute_requested = false;
     int arrow_size_percent = 100;
-    uint32_t route_colour = IM_COL32(255, 145, 35, 245);
+    uint32_t route_colour = 0xF52391FFu;
     int optimization_quality = 1;
     int relaxation_passes = 8;
     int randomized_restarts = 12;
@@ -1870,6 +1870,7 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
             if (world_surface) {
                 dl->PushClipRect(clip.Min, clip.Max, true);
                 const ImU32 colour = route_colour;
+                const bool draw_world_arrows = GW::UI::GetIsWorldMapShowing();
                 for (size_t i = first_route_point; i < route.size(); i++) {
                     GW::Vec2f wm;
                     ImVec2 screen;
@@ -1878,6 +1879,11 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
                         ? ProjectWorldMap(wm, screen, clip)
                         : ProjectMissionMap(wm, screen, clip);
                     if (!projected) continue;
+                    if (!draw_world_arrows) {
+                        dl->AddLine(previous, screen, colour, route_thickness_);
+                        previous = screen;
+                        continue;
+                    }
                     const float dx = screen.x - previous.x, dy = screen.y - previous.y;
                     const float length = hypotf(dx, dy);
                     if (length > 7.f) {
