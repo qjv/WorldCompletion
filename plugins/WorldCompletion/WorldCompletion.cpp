@@ -86,6 +86,8 @@ namespace {
     int optimization_quality = 2;
     int relaxation_passes = 8;
     int randomized_restarts = 12;
+    int end_portal_index = -1;
+    uint32_t end_portal_map = 0;
     uint32_t resume_after = 0;
     uint32_t last_rebuild = 0;
     uint32_t last_fog_check = 0;
@@ -111,6 +113,7 @@ namespace {
     bool ground_vertices_dirty = true;
     size_t route_progress = 0;
     size_t ground_progress = 0;
+    std::optional<GW::GamePos> route_end_portal_point;
 
     GW::Constants::MapID CartographyMapID();
 
@@ -133,6 +136,7 @@ namespace {
         ground_vertices_dirty = true;
         route_progress = 0;
         ground_progress = 0;
+        route_end_portal_point.reset();
     }
 
     void SuspendRoute(const uint32_t now)
@@ -263,6 +267,29 @@ namespace {
         const float left = t->XBL + a * (t->XTL - t->XBL);
         const float right = t->XBR + a * (t->XTR - t->XBR);
         return p.x >= left && p.x <= right;
+    }
+
+    GW::Vec2f ClosestPoint(const GW::PathingTrapezoid* trap, const GW::Vec2f& point)
+    {
+        if (Contains(trap, point)) return point;
+        const GW::Vec2f corners[4] = {{trap->XTL, trap->YT}, {trap->XTR, trap->YT},
+                                      {trap->XBR, trap->YB}, {trap->XBL, trap->YB}};
+        GW::Vec2f closest = corners[0];
+        float closest_distance = FLT_MAX;
+        for (size_t i = 0; i < 4; i++) {
+            const auto a = corners[i], b = corners[(i + 1) % 4];
+            const float dx = b.x - a.x, dy = b.y - a.y;
+            const float length_sq = dx * dx + dy * dy;
+            const float t = length_sq > 0.f
+                ? std::clamp(((point.x - a.x) * dx + (point.y - a.y) * dy) / length_sq, 0.f, 1.f) : 0.f;
+            const GW::Vec2f candidate{a.x + dx * t, a.y + dy * t};
+            const float ox = candidate.x - point.x, oy = candidate.y - point.y;
+            const float distance = ox * ox + oy * oy;
+            if (distance >= closest_distance) continue;
+            closest_distance = distance;
+            closest = candidate;
+        }
+        return closest;
     }
 
     GW::GamePos Centre(const GW::PathingTrapezoid* t)
@@ -945,13 +972,46 @@ namespace {
         std::vector<std::vector<float>> costs(target_count + 1, std::vector<float>(target_count + 1, FLT_MAX));
         const auto trap_at = [&](const size_t i) { return i == target_count ? start : candidates[selected[i]].trap; };
         const auto point_at = [&](const size_t i) { return i == target_count ? player->pos : candidates[selected[i]].pos; };
-        for (size_t i = 0; i <= target_count; i++) {
-            costs[i][i] = 0.f;
-            for (size_t j = i + 1; j <= target_count; j++) {
-                const float cost = connection_cost(trap_at(i), point_at(i), trap_at(j), point_at(j));
-                costs[i][j] = costs[j][i] = cost;
+        const auto rebuild_graph_costs = [&] {
+            for (size_t i = 0; i <= target_count; i++) {
+                costs[i][i] = 0.f;
+                std::unordered_map<const GW::PathingTrapezoid*, float> distance;
+                using QueueEntry = std::pair<float, const GW::PathingTrapezoid*>;
+                std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<>> open;
+                distance.emplace(trap_at(i), 0.f);
+                open.emplace(0.f, trap_at(i));
+                while (!open.empty()) {
+                    const auto [travelled, at] = open.top();
+                    open.pop();
+                    const auto known = distance.find(at);
+                    if (known == distance.end() || travelled > known->second + .01f) continue;
+                    const auto edges = graph.find(at);
+                    if (edges == graph.end()) continue;
+                    for (const auto* next : edges->second) {
+                        const auto a = Centre(at), b = Centre(next);
+                        const float candidate = travelled + hypotf(b.x - a.x, b.y - a.y);
+                        const auto old = distance.find(next);
+                        if (old != distance.end() && candidate + .01f >= old->second) continue;
+                        distance[next] = candidate;
+                        open.emplace(candidate, next);
+                    }
+                }
+                const auto source_center = Centre(trap_at(i));
+                for (size_t j = i + 1; j <= target_count; j++) {
+                    if (trap_at(i) == trap_at(j)) {
+                        costs[i][j] = costs[j][i] = connection_cost(trap_at(i), point_at(i), trap_at(j), point_at(j));
+                        continue;
+                    }
+                    const auto found = distance.find(trap_at(j));
+                    if (found == distance.end()) continue;
+                    const auto target_center = Centre(trap_at(j));
+                    const float source_offset = hypotf(point_at(i).x - source_center.x, point_at(i).y - source_center.y);
+                    const float target_offset = hypotf(point_at(j).x - target_center.x, point_at(j).y - target_center.y);
+                    costs[i][j] = costs[j][i] = source_offset + found->second + target_offset;
+                }
             }
-        }
+        };
+        rebuild_graph_costs();
 
         std::vector<size_t> order_pool(target_count);
         std::iota(order_pool.begin(), order_pool.end(), 0);
@@ -1113,13 +1173,7 @@ namespace {
         // cost matrix then describes positions that no longer exist, which was
         // producing sequences such as 7 -> past 9 -> 8 -> back to 9. Recompute
         // graph costs for the final footings and optimize the order once more.
-        for (size_t i = 0; i <= target_count; i++) {
-            costs[i][i] = 0.f;
-            for (size_t j = i + 1; j <= target_count; j++) {
-                const float cost = connection_cost(trap_at(i), point_at(i), trap_at(j), point_at(j));
-                costs[i][j] = costs[j][i] = cost;
-            }
-        }
+        rebuild_graph_costs();
         for (int pass = 0; pass < two_opt_passes; pass++) {
             bool improved = false;
             for (size_t i = 0; i + 1 < order.size(); i++) {
@@ -1389,12 +1443,44 @@ namespace {
             GW::GamePos waypoint_ground = target->pos;
             route_waypoint_altitudes.push_back(GW::Map::QueryAltitude(&waypoint_ground, 64.f));
             std::vector<GW::GamePos> raw{route.back()};
+            std::vector<std::pair<GW::Vec2f, GW::Vec2f>> crossing_edges{{
+                {route.back().x, route.back().y}, {route.back().x, route.back().y}}};
             const GW::PathingTrapezoid* previous_trap = from;
             for (const auto* at : leg) {
-                raw.push_back(TransitionPoint(previous_trap, at));
+                const auto edge = TransitionPortal(previous_trap, at);
+                raw.push_back({(edge.first.x + edge.second.x) * .5f,
+                               (edge.first.y + edge.second.y) * .5f, 0});
+                crossing_edges.push_back(edge);
                 previous_trap = at;
             }
             raw.push_back(target->pos);
+            crossing_edges.push_back({{target->pos.x, target->pos.y}, {target->pos.x, target->pos.y}});
+            for (int pass = 0; pass < 12; pass++) {
+                bool moved = false;
+                for (size_t i = 1; i + 1 < raw.size(); i++) {
+                    const auto [edge_a, edge_b] = crossing_edges[i];
+                    const float edge_dx = edge_b.x - edge_a.x, edge_dy = edge_b.y - edge_a.y;
+                    if (edge_dx * edge_dx + edge_dy * edge_dy < 1.f) continue;
+                    const auto objective = [&](const float t) {
+                        const float x = edge_a.x + edge_dx * t, y = edge_a.y + edge_dy * t;
+                        return hypotf(x - raw[i - 1].x, y - raw[i - 1].y)
+                            + hypotf(raw[i + 1].x - x, raw[i + 1].y - y);
+                    };
+                    float low = 0.f, high = 1.f;
+                    for (int iteration = 0; iteration < 18; iteration++) {
+                        const float left = (low * 2.f + high) / 3.f;
+                        const float right = (low + high * 2.f) / 3.f;
+                        if (objective(left) <= objective(right)) high = right;
+                        else low = left;
+                    }
+                    const float t = (low + high) * .5f;
+                    const GW::GamePos candidate{edge_a.x + edge_dx * t, edge_a.y + edge_dy * t, 0};
+                    if (hypotf(candidate.x - raw[i].x, candidate.y - raw[i].y) < .1f) continue;
+                    raw[i] = candidate;
+                    moved = true;
+                }
+                if (!moved) break;
+            }
 
             const auto shortcut_is_safe = [&](const size_t begin, const size_t end) {
                 return segment_is_safe({raw[begin].x, raw[begin].y}, {raw[end].x, raw[end].y});
@@ -1412,6 +1498,57 @@ namespace {
                 at = next;
             }
             from = target->trap;
+        }
+        if (end_portal_index >= 0 && end_portal_map == static_cast<uint32_t>(route_map)) {
+            const world_completion_portals::Location* selected_portal = nullptr;
+            int portal_number = 0;
+            for (const auto& endpoint : world_completion_portals::locations) {
+                if (endpoint.map_id != end_portal_map) continue;
+                if (portal_number++ == end_portal_index) { selected_portal = &endpoint; break; }
+            }
+            if (selected_portal) {
+                const GW::Vec2f endpoint{selected_portal->x, selected_portal->y};
+                const GW::PathingTrapezoid* portal_trap = nullptr;
+                GW::Vec2f portal_goal{};
+                float best_distance = FLT_MAX;
+                for (const auto* trap : reachable) {
+                    const auto candidate = ClosestPoint(trap, endpoint);
+                    const float dx = candidate.x - endpoint.x, dy = candidate.y - endpoint.y;
+                    const float distance = dx * dx + dy * dy;
+                    if (distance >= best_distance) continue;
+                    best_distance = distance;
+                    portal_trap = trap;
+                    portal_goal = candidate;
+                }
+                if (portal_trap) {
+                    const GW::GamePos goal{portal_goal.x, portal_goal.y, 0};
+                    const auto leg = find_leg(from, portal_trap, &route.back());
+                    if (from == portal_trap || !leg.empty()) {
+                    std::vector<GW::GamePos> raw{route.back()};
+                    const auto* previous_trap = from;
+                    for (const auto* at : leg) {
+                        raw.push_back(TransitionPoint(previous_trap, at));
+                        previous_trap = at;
+                    }
+                    raw.push_back(goal);
+                    size_t at = 0;
+                    while (at + 1 < raw.size()) {
+                        size_t next = at + 1;
+                        const size_t furthest = std::min(raw.size() - 1, at + 96);
+                        for (size_t candidate = furthest; candidate > at + 1; candidate--) {
+                            if (segment_is_safe({raw[at].x, raw[at].y}, {raw[candidate].x, raw[candidate].y})) {
+                                next = candidate;
+                                break;
+                            }
+                        }
+                        route.push_back(raw[next]);
+                        route_fixed.push_back(next + 1 == raw.size());
+                        at = next;
+                    }
+                    route_end_portal_point = goal;
+                    }
+                }
+            }
         }
         for (int pass = 0; pass < 24; pass++) {
             bool moved = false;
@@ -1783,12 +1920,15 @@ void WorldCompletionPlugin::LoadSettings(const wchar_t* folder)
     LoadSetting("show_ground_route", show_ground_route_);
     LoadSetting("occlude_ground_route", occlude_ground_route_);
     LoadSetting("show_numbers", show_numbers_);
+    LoadSetting("show_cursor_coordinates", show_cursor_coordinates_);
     LoadSetting("route_thickness", route_thickness_);
     LoadSetting("arrow_size_percent", arrow_size_percent);
     LoadSetting("route_colour", route_colour);
     LoadSetting("optimization_quality", optimization_quality);
     LoadSetting("relaxation_passes", relaxation_passes);
     LoadSetting("randomized_restarts", randomized_restarts);
+    LoadSetting("end_portal_index", end_portal_index);
+    LoadSetting("end_portal_map", end_portal_map);
     arrow_size_percent = std::clamp(arrow_size_percent, 10, 250);
     optimization_quality = std::clamp(optimization_quality, 0, 2);
     relaxation_passes = std::clamp(relaxation_passes, 0, 8);
@@ -1803,12 +1943,15 @@ void WorldCompletionPlugin::SaveSettings(const wchar_t* folder)
     SaveSetting("show_ground_route", show_ground_route_);
     SaveSetting("occlude_ground_route", occlude_ground_route_);
     SaveSetting("show_numbers", show_numbers_);
+    SaveSetting("show_cursor_coordinates", show_cursor_coordinates_);
     SaveSetting("route_thickness", route_thickness_);
     SaveSetting("arrow_size_percent", arrow_size_percent);
     SaveSetting("route_colour", route_colour);
     SaveSetting("optimization_quality", optimization_quality);
     SaveSetting("relaxation_passes", relaxation_passes);
     SaveSetting("randomized_restarts", randomized_restarts);
+    SaveSetting("end_portal_index", end_portal_index);
+    SaveSetting("end_portal_map", end_portal_map);
     ToolboxUIPlugin::SaveSettings(folder);
 }
 
@@ -1930,6 +2073,7 @@ void WorldCompletionPlugin::DrawSettings()
     ImGui::Checkbox("Show route on the ground", &show_ground_route_);
     ImGui::Checkbox("Occlude ground route", &occlude_ground_route_);
     ImGui::Checkbox("Show waypoint numbers", &show_numbers_);
+    ImGui::Checkbox("Show map cursor coordinates", &show_cursor_coordinates_);
     ImGui::SliderFloat("Route thickness", &route_thickness_, 1.f, 6.f, "%.1f px");
     ImGui::SliderInt("Arrow size", &arrow_size_percent, 10, 250, "%d%%");
     ImVec4 colour = ImGui::ColorConvertU32ToFloat4(route_colour);
@@ -1943,6 +2087,30 @@ void WorldCompletionPlugin::DrawSettings()
     optimization_changed |= ImGui::SliderInt("Relaxation passes", &relaxation_passes, 0, 8);
     optimization_changed |= ImGui::SliderInt("Randomized restarts", &randomized_restarts, 0, 12);
     if (optimization_changed) recompute_requested.store(true, std::memory_order_release);
+    const uint32_t current_map = static_cast<uint32_t>(GW::Map::GetMapID());
+    std::vector<const world_completion_portals::Location*> portals;
+    for (const auto& endpoint : world_completion_portals::locations) {
+        if (endpoint.map_id == current_map) portals.push_back(&endpoint);
+    }
+    int selection = end_portal_map == current_map ? end_portal_index + 1 : 0;
+    const std::string portal_preview = selection > 0 ? "Portal " + std::to_string(selection) : "No forced end";
+    if (ImGui::BeginCombo("End route at portal", portal_preview.c_str())) {
+        if (ImGui::Selectable("No forced end", selection == 0)) {
+            end_portal_index = -1;
+            end_portal_map = 0;
+            recompute_requested.store(true, std::memory_order_release);
+        }
+        for (size_t i = 0; i < portals.size(); i++) {
+            const std::string label = "Portal " + std::to_string(i + 1) + " ("
+                + std::to_string(static_cast<int>(portals[i]->x)) + ", "
+                + std::to_string(static_cast<int>(portals[i]->y)) + ")";
+            if (!ImGui::Selectable(label.c_str(), selection == static_cast<int>(i + 1))) continue;
+            end_portal_index = static_cast<int>(i);
+            end_portal_map = current_map;
+            recompute_requested.store(true, std::memory_order_release);
+        }
+        ImGui::EndCombo();
+    }
 }
 
 void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
@@ -1999,6 +2167,49 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
             button_draw->AddTriangleFilled({center.x + 8.f, center.y - 4.f}, {center.x + 11.f, center.y + 2.f},
                                            {center.x + 4.f, center.y + 1.f}, route_colour);
             if (refresh_hovered) ImGui::SetTooltip("Recompute the world-completion route");
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+
+        ImGui::SetNextWindowPos({mission_clip.Max.x - button_size - 7.f,
+                                 mission_clip.Max.y - button_size * 2.f - button_gap - 7.f});
+        ImGui::SetNextWindowBgAlpha(0.f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0.f, 0.f});
+        if (ImGui::Begin("##world_completion_portal_end", nullptr, flags)) {
+            if (ImGui::InvisibleButton("##portal_end", {button_size, button_size})) ImGui::OpenPopup("##portal_picker");
+            const bool hovered = ImGui::IsItemHovered();
+            const ImVec2 min = ImGui::GetItemRectMin(), max = ImGui::GetItemRectMax();
+            auto* draw = ImGui::GetWindowDrawList();
+            draw->AddRectFilled(min, max, hovered ? IM_COL32(239, 246, 248, 255) : IM_COL32(213, 226, 230, 245), 5.f);
+            draw->AddRect(min, max, IM_COL32(20, 42, 50, 255), 5.f, 0, 2.f);
+            const ImU32 portal_colour = end_portal_index >= 0 ? route_colour : IM_COL32(75, 91, 98, 255);
+            draw->AddLine({min.x + 9.f, min.y + 6.f}, {min.x + 9.f, max.y - 6.f}, portal_colour, 2.f);
+            draw->AddTriangleFilled({min.x + 10.f, min.y + 7.f}, {max.x - 6.f, min.y + 11.f},
+                                    {min.x + 10.f, min.y + 16.f}, portal_colour);
+            if (hovered) ImGui::SetTooltip("Choose an optional final portal");
+            if (ImGui::BeginPopup("##portal_picker")) {
+                if (ImGui::Selectable("No forced end", end_portal_index < 0)) {
+                    end_portal_index = -1;
+                    end_portal_map = 0;
+                    recompute_requested.store(true, std::memory_order_release);
+                }
+                const uint32_t map_id = static_cast<uint32_t>(GW::Map::GetMapID());
+                int portal_number = 0;
+                for (const auto& endpoint : world_completion_portals::locations) {
+                    if (endpoint.map_id != map_id) continue;
+                    const std::string label = "Portal " + std::to_string(portal_number + 1) + " ("
+                        + std::to_string(static_cast<int>(endpoint.x)) + ", "
+                        + std::to_string(static_cast<int>(endpoint.y)) + ")";
+                    const bool selected = end_portal_map == map_id && end_portal_index == portal_number;
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        end_portal_index = portal_number;
+                        end_portal_map = map_id;
+                        recompute_requested.store(true, std::memory_order_release);
+                    }
+                    portal_number++;
+                }
+                ImGui::EndPopup();
+            }
         }
         ImGui::End();
         ImGui::PopStyleVar();
@@ -2089,6 +2300,44 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
                 }
                 dl->PopClipRect();
             }
+        }
+    }
+
+    if (show_cursor_coordinates_) {
+        const ImVec2 mouse = ImGui::GetMousePos();
+        ImRect clip;
+        ImVec2 projected;
+        GW::Vec2f world;
+        bool hovering = false;
+        if (ProjectWorldMap({}, projected, clip) && clip.Contains(mouse)) {
+            const auto* context = GW::Map::GetWorldMapContext();
+            const GW::Vec2f span = context->bottom_right - context->top_left;
+            world = {context->top_left.x + (mouse.x - clip.Min.x) * span.x / clip.GetWidth(),
+                     context->top_left.y + (mouse.y - clip.Min.y) * span.y / clip.GetHeight()};
+            hovering = true;
+        }
+        else if (ProjectMissionMap({}, projected, clip) && clip.Contains(mouse)) {
+            const auto* context = GW::Map::GetMissionMapContext();
+            const auto* root = GW::UI::GetRootFrame();
+            const auto* frame = context && root ? GW::UI::GetFrameById(context->frame_id) : nullptr;
+            if (context && context->h003c && frame) {
+                const GW::Vec2f scale = frame->position.GetViewportScale(root);
+                const GW::Vec2f center{(clip.Min.x + clip.Max.x) * .5f, (clip.Min.y + clip.Max.y) * .5f};
+                const float zoom = GW::GetGameplayContext() ? GW::GetGameplayContext()->mission_map_zoom : 1.f;
+                if (fabsf(scale.x * zoom) > .0001f && fabsf(scale.y * zoom) > .0001f) {
+                    world = {context->h003c->mission_map_pan_offset.x + (mouse.x - center.x) / (scale.x * zoom),
+                             context->h003c->mission_map_pan_offset.y + (mouse.y - center.y) / (scale.y * zoom)};
+                    hovering = true;
+                }
+            }
+        }
+        GW::Vec2f game;
+        if (hovering && WorldToGame(world, game, CartographyMapID())) {
+            char coordinates[64];
+            snprintf(coordinates, sizeof(coordinates), "x %.0f  y %.0f", game.x, game.y);
+            auto* foreground = ImGui::GetForegroundDrawList();
+            foreground->AddText({mouse.x + 13.f, mouse.y + 13.f}, IM_COL32(0, 0, 0, 255), coordinates);
+            foreground->AddText({mouse.x + 12.f, mouse.y + 12.f}, IM_COL32(255, 255, 255, 255), coordinates);
         }
     }
 

@@ -30,6 +30,7 @@ private:
     bool show_ground_route_ = true;
     bool occlude_ground_route_ = true;
     bool show_numbers_ = true;
+    bool show_cursor_coordinates_ = true;
     float route_thickness_ = 2.5f;
     std::wstring settings_folder_;
 };

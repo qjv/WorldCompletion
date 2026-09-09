@@ -10,6 +10,8 @@ WorldCompletion is an experimental [GWToolbox++](https://github.com/gwdevhub/GWT
 - Provides arrow sizing from 10% to 250% and a configurable route color.
 - Provides optional depth-tested ground rendering so terrain can occlude arrows.
 - Includes adjacent minimap controls for visibility and explicit recomputation.
+- Shows local game coordinates beside the cursor while hovering either map.
+- Can optionally finish the route at a selected numbered portal on the current map.
 - Marks narrow mandatory stops and omits completed reveal targets.
 - Suspends route state during travel and map transitions.
 - Uses bounded optimization passes to avoid long loading stalls.
@@ -40,11 +42,11 @@ Then configure GWToolbox++ normally and build the `WorldCompletion` target. The 
 
 The plugin reads Guild Wars' live cartography bitfield and pathing trapezoids through GWCA. It maps unexplored fog cells to reachable standing candidates, favors candidates that reveal multiple required cells, and reduces redundant stops while preserving coverage.
 
-Route construction uses the game's pathing-plane and portal connectivity. A bounded shortest-path search creates traversable legs between selected stops. The visit order is refined with the original forward-only open-path 2-opt, relocation, footing, and coverage-preserving morph passes. Settings adjust only their bounded iteration budgets; the maximum values reproduce the original behavior.
+Route construction uses the game's pathing-plane and portal connectivity. Cached Dijkstra runs provide navigable graph costs for the waypoint-ordering matrix, preventing nearby-looking stops on distant corridor branches from being treated as cheap pairs. A bounded shortest-path search creates traversable legs between selected stops. The visit order is refined with the original forward-only open-path 2-opt, relocation, footing, and coverage-preserving morph passes. Settings adjust only their bounded iteration budgets; the maximum values reproduce the original behavior.
 
 Progress is constrained to the current unfinished target rather than chosen globally from the nearest route geometry. This prevents crossings and shared road sections from skipping later targets. The ground route samples terrain altitude and renders contiguous chevrons with independently interpolated Z intervals. With occlusion enabled, those triangles are depth-tested against the game scene.
 
-Final route geometry uses the original transition expansion, validated shortcut selection, and elastic corner smoothing pipeline. The later alternating relaxation, forced portal-midpoint chain, and experimental corridor funnel were rolled back after they caused zigzags or invalid terrain crossings.
+Final route geometry uses transition expansion, validated shortcut selection, and elastic corner smoothing. Shared pathing-boundary crossings are additionally relaxed along their actual portal edges, minimizing adjacent segment length without moving the crossing outside walkable topology. Experimental unconstrained corridor funneling was rejected because it could cross terrain.
 
 Expensive search stages use user-bounded iteration counts and cached geometry. Route computation is triggered by meaningful map/cartography changes or the recompute button rather than every frame. Travel, map-change, and map-loaded messages suspend the route and release Direct3D state before map-owned resources change.
 
