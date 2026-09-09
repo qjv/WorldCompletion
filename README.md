@@ -11,7 +11,7 @@ WorldCompletion is an experimental [GWToolbox++](https://github.com/gwdevhub/GWT
 - Provides optional depth-tested ground rendering so terrain can occlude arrows.
 - Includes adjacent minimap controls for visibility and explicit recomputation.
 - Shows local game coordinates beside the cursor while hovering either map.
-- Can optionally finish the route at a selected numbered portal on the current map.
+- Can optionally finish the route at a selected numbered portal on the current map, combining embedded endpoints with live portal props detected through GWCA.
 - Marks narrow mandatory stops and omits completed reveal targets.
 - Suspends route state during travel and map transitions.
 - Uses bounded optimization passes to avoid long loading stalls.

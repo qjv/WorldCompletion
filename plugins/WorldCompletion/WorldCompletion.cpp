@@ -478,6 +478,29 @@ namespace {
         }
     }
 
+    std::vector<GW::Vec2f> CurrentPortalEndpoints()
+    {
+        std::vector<GW::Vec2f> endpoints;
+        const uint32_t map_id = static_cast<uint32_t>(GW::Map::GetMapID());
+        for (const auto& endpoint : world_completion_portals::locations) {
+            if (endpoint.map_id == map_id) endpoints.push_back({endpoint.x, endpoint.y});
+        }
+        if (const auto* context = GW::GetMapContext(); context && context->props) {
+            for (const auto* prop : context->props->propArray) {
+                if (!prop || !prop->model_info || !IsPortalModel(FileHashToFileId(prop->model_info->model_file_name))) continue;
+                const GW::Vec2f point{prop->position.x, prop->position.y};
+                const bool duplicate = std::ranges::any_of(endpoints, [&](const GW::Vec2f& existing) {
+                    return hypotf(existing.x - point.x, existing.y - point.y) < 1800.f;
+                });
+                if (!duplicate) endpoints.push_back(point);
+            }
+        }
+        std::ranges::sort(endpoints, [](const GW::Vec2f& a, const GW::Vec2f& b) {
+            return a.x == b.x ? a.y < b.y : a.x < b.x;
+        });
+        return endpoints;
+    }
+
     std::vector<Doorway> GetBlockedDoorways(const GW::MapContext* context)
     {
         std::vector<Doorway> result;
@@ -1500,14 +1523,9 @@ namespace {
             from = target->trap;
         }
         if (end_portal_index >= 0 && end_portal_map == static_cast<uint32_t>(route_map)) {
-            const world_completion_portals::Location* selected_portal = nullptr;
-            int portal_number = 0;
-            for (const auto& endpoint : world_completion_portals::locations) {
-                if (endpoint.map_id != end_portal_map) continue;
-                if (portal_number++ == end_portal_index) { selected_portal = &endpoint; break; }
-            }
-            if (selected_portal) {
-                const GW::Vec2f endpoint{selected_portal->x, selected_portal->y};
+            const auto portal_endpoints = CurrentPortalEndpoints();
+            if (static_cast<size_t>(end_portal_index) < portal_endpoints.size()) {
+                const GW::Vec2f endpoint = portal_endpoints[static_cast<size_t>(end_portal_index)];
                 const GW::PathingTrapezoid* portal_trap = nullptr;
                 GW::Vec2f portal_goal{};
                 float best_distance = FLT_MAX;
@@ -2088,10 +2106,7 @@ void WorldCompletionPlugin::DrawSettings()
     optimization_changed |= ImGui::SliderInt("Randomized restarts", &randomized_restarts, 0, 12);
     if (optimization_changed) recompute_requested.store(true, std::memory_order_release);
     const uint32_t current_map = static_cast<uint32_t>(GW::Map::GetMapID());
-    std::vector<const world_completion_portals::Location*> portals;
-    for (const auto& endpoint : world_completion_portals::locations) {
-        if (endpoint.map_id == current_map) portals.push_back(&endpoint);
-    }
+    const auto portals = CurrentPortalEndpoints();
     int selection = end_portal_map == current_map ? end_portal_index + 1 : 0;
     const std::string portal_preview = selection > 0 ? "Portal " + std::to_string(selection) : "No forced end";
     if (ImGui::BeginCombo("End route at portal", portal_preview.c_str())) {
@@ -2102,8 +2117,8 @@ void WorldCompletionPlugin::DrawSettings()
         }
         for (size_t i = 0; i < portals.size(); i++) {
             const std::string label = "Portal " + std::to_string(i + 1) + " ("
-                + std::to_string(static_cast<int>(portals[i]->x)) + ", "
-                + std::to_string(static_cast<int>(portals[i]->y)) + ")";
+                + std::to_string(static_cast<int>(portals[i].x)) + ", "
+                + std::to_string(static_cast<int>(portals[i].y)) + ")";
             if (!ImGui::Selectable(label.c_str(), selection == static_cast<int>(i + 1))) continue;
             end_portal_index = static_cast<int>(i);
             end_portal_map = current_map;
@@ -2194,19 +2209,18 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9* device)
                     recompute_requested.store(true, std::memory_order_release);
                 }
                 const uint32_t map_id = static_cast<uint32_t>(GW::Map::GetMapID());
-                int portal_number = 0;
-                for (const auto& endpoint : world_completion_portals::locations) {
-                    if (endpoint.map_id != map_id) continue;
+                const auto endpoints = CurrentPortalEndpoints();
+                for (size_t portal_number = 0; portal_number < endpoints.size(); portal_number++) {
+                    const auto& endpoint = endpoints[portal_number];
                     const std::string label = "Portal " + std::to_string(portal_number + 1) + " ("
                         + std::to_string(static_cast<int>(endpoint.x)) + ", "
                         + std::to_string(static_cast<int>(endpoint.y)) + ")";
-                    const bool selected = end_portal_map == map_id && end_portal_index == portal_number;
+                    const bool selected = end_portal_map == map_id && end_portal_index == static_cast<int>(portal_number);
                     if (ImGui::Selectable(label.c_str(), selected)) {
-                        end_portal_index = portal_number;
+                        end_portal_index = static_cast<int>(portal_number);
                         end_portal_map = map_id;
                         recompute_requested.store(true, std::memory_order_release);
                     }
-                    portal_number++;
                 }
                 ImGui::EndPopup();
             }
