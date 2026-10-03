@@ -1,66 +1,74 @@
 # WorldCompletion
 
-WorldCompletion is an experimental [GWToolbox++](https://github.com/gwdevhub/GWToolboxpp) plugin for Guild Wars. It builds a route through the still-unexplored portions of the current explorable area and displays that route as directional arrows on the world map, mission map, minimap, and game world.
+A [GWToolbox++](https://github.com/gwdevhub/GWToolboxpp) plugin that plans a route through the unexplored parts of a Guild Wars area.
 
-## Features
+This project is vibecoded.
 
-- Recomputes the route as cartography progress changes.
-- Keeps route progress monotonic through intersections and overlapping roads.
-- Draws a gap-free minimap line plus adjustable, end-to-end directional arrows on the world map and terrain.
-- Provides arrow sizing from 10% to 250% and a configurable route color.
-- Provides optional depth-tested ground rendering so terrain can occlude arrows.
-- Includes adjacent minimap controls for visibility and explicit recomputation.
-- Shows local game coordinates beside the cursor while hovering either map.
-- Can optionally finish the route at a selected numbered portal on the current map, combining embedded endpoints with live portal props detected through GWCA.
-- Marks narrow mandatory stops and omits completed reveal targets.
-- Suspends route state during travel and map transitions.
-- Uses bounded optimization passes to avoid long loading stalls.
-- Exposes fast, balanced, and thorough optimization modes, relaxation passes, and randomized restart counts.
-- Saves appearance and optimizer settings explicitly when the plugin unloads.
+## Using it
 
-## Installation
+1. Copy `WorldCompletion.dll` into your Toolbox profile’s `plugins` folder.
+2. Enable it in Toolbox’s plugin settings.
+3. Enter an explorable area and open the mission map with **U**.
 
-Download `WorldCompletion.dll` from the latest release and copy it to your GWToolbox plugin directory. For the configuration used during development, that is:
+The current leg is highlighted; later legs are faded. The route also appears on the ground. Colors, thickness, outlines, arrows, waypoint size, and the amount of ground route shown are adjustable in the plugin settings.
 
-```text
-GWToolboxpp-config/<profile>/plugins/WorldCompletion.dll
-```
+Click a numbered portal marker on the mission map to finish the route there. The planner recalculates the visit order with that portal as the endpoint. Click the selected portal again to clear it.
 
-Restart Guild Wars/GWToolbox or reload the plugin. This repository contains only the plugin; it does not replace or update GWToolbox itself.
+The map toggle disables planning and the overlays. The refresh button rebuilds the route from your current position.
+
+## How the route works
+
+Planning runs in the background. Reading the navigation mesh and sampling terrain are spread across frames to keep the game responsive. Disabling the plugin, changing maps, or unloading cancels pending work.
+
+The planner uses the game’s navigation mesh, blocked floors, and portal connections. It selects discovery stops, then orders them using walking costs rather than straight-line distances. Routes with up to 15 stops use exact ordering; larger routes use bounded refinement from both the player and the selected endpoint.
+
+Overlapping visits remain separate legs, so crossing an earlier segment does not count as reaching a later stop. The active leg is drawn above future legs.
+
+This is still experimental. Coverage selection and navigation costs are approximations, so the route is not guaranteed to be the shortest possible. Map clicks and rendering need in-game testing; the automated tests cover the planner.
 
 ## Building
 
-The source is arranged under `plugins/WorldCompletion` so it can be copied into a GWToolbox++ checkout. Add this entry to `cmake/gwtoolboxdll_plugins.cmake` alongside the other plugin declarations:
+The plugin builds independently of Toolbox. It uses an existing Toolbox checkout’s headers and SDK libraries; the build script does not rebuild or install the Toolbox host. Use an SDK that matches your installed Toolbox, and a Toolbox build compatible with the current Guild Wars client.
 
-```cmake
-add_tb_plugin(WorldCompletion)
+On Linux, you need Python 3, CMake 3.25+, Ninja, Wine, and an MSVC/Windows SDK toolchain. The Toolbox SDK build must contain `imgui.lib`, `GWToolboxdll/GWToolboxdll.lib`, GWCA, and the dependency headers and libraries.
+
+```sh
+./build_and_copy.sh --toolbox-root /path/to/GWToolboxpp --build-only
+./build_and_copy.sh --toolbox-root /path/to/GWToolboxpp --destination /path/to/plugins
 ```
 
-Then configure GWToolbox++ normally and build the `WorldCompletion` target. The released binary is built as 32-bit Windows `RelWithDebInfo` using the project's Wine/MSVC Docker toolchain.
+The DLL is written to `bin/WorldCompletion.dll`. Installation backs up the previous DLL before replacing it. Reload the plugin afterward.
 
-## Methodology
+For the local development setup, `./build_and_copy.sh` also copies the DLL into the configured Guild Wars plugin folder. It defaults to `~/Documents/gwtb`, or the built `~/Documents/gwtb-sep30-fix` checkout when present. The default install path is `/run/media/tulio/ssd/Games/Guild Wars/GWToolboxpp-config/TULIO/plugins`; use `--destination` for another installation.
 
-The plugin reads Guild Wars' live cartography bitfield and pathing trapezoids through GWCA. It maps unexplored fog cells to reachable standing candidates, favors candidates that reveal multiple required cells, and reduces redundant stops while preserving coverage.
+### Compiler setup
 
-Route construction uses the game's pathing-plane and portal connectivity. Cached Dijkstra runs provide navigable graph costs for the waypoint-ordering matrix, preventing nearby-looking stops on distant corridor branches from being treated as cheap pairs. A bounded shortest-path search creates traversable legs between selected stops. The visit order is refined with the original forward-only open-path 2-opt, relocation, footing, and coverage-preserving morph passes. Settings adjust only their bounded iteration budgets; the maximum values reproduce the original behavior.
+[msvc-wine](https://github.com/mstorsjo/msvc-wine) provides Microsoft’s compiler and Windows SDK for use under Wine. Install Wine and `msitools`, then:
 
-Progress is constrained to the current unfinished target rather than chosen globally from the nearest route geometry. This prevents crossings and shared road sections from skipping later targets. The ground route samples terrain altitude and renders contiguous chevrons with independently interpolated Z intervals. With occlusion enabled, those triangles are depth-tested against the game scene.
+```sh
+mkdir -p build/toolchain
+git clone https://github.com/mstorsjo/msvc-wine.git build/toolchain/msvc-wine
+git -C build/toolchain/msvc-wine checkout 514f8ea34842cd6d831804d0e9658d3a32870ae1
+python3 build/toolchain/msvc-wine/vsdownload.py --architecture x86 x64 --dest build/toolchain/msvc
+env WINEPREFIX="$PWD/build/wine-prefix" sh build/toolchain/msvc-wine/install.sh "$PWD/build/toolchain/msvc"
+```
 
-Final route geometry uses transition expansion, validated shortcut selection, and elastic corner smoothing. Shared pathing-boundary crossings are additionally relaxed along their actual portal edges, minimizing adjacent segment length without moving the crossing outside walkable topology. Experimental unconstrained corridor funneling was rejected because it could cross terrain.
+Use `--toolchain-root /path/to/msvc` for a different toolchain location. `--docker` uses an existing `gwtoolboxpp-wine-msvc` image; it does not download or build that image.
 
-Expensive search stages use user-bounded iteration counts and cached geometry. Route computation is triggered by meaningful map/cartography changes or the recompute button rather than every frame. Travel, map-change, and map-loaded messages suspend the route and release Direct3D state before map-owned resources change.
+## Tests
+
+```sh
+python3 tests/run_tests.py
+```
+
+The tests run on Linux with AddressSanitizer and UndefinedBehaviorSanitizer. They cover navigation boundaries, disconnected and blocked floors, floor transitions, detours, portal endpoints, visit ordering, and cancellation.
 
 ## Credits
 
-- [GWToolbox++](https://github.com/gwdevhub/GWToolboxpp) and the Guild Wars Dev Hub contributors for the plugin host, build system, utilities, and original MIT license.
-- [GWCA](https://github.com/GWCA/GWCA) contributors for the Guild Wars client API and game data access.
-- [Dear ImGui](https://github.com/ocornut/imgui) contributors for overlay drawing and settings controls.
-- ArenaNet for Guild Wars. This is an unofficial community project and is not affiliated with or endorsed by ArenaNet or NCSOFT.
+- [GWToolbox++ and Guild Wars Dev Hub](https://github.com/gwdevhub/GWToolboxpp): the plugin host, plugin base classes, settings support, and utilities this project builds on.
+- [GWCA](https://github.com/GWCA/GWCA): access to Guild Wars game state, navigation data, and game APIs.
+- [Dear ImGui](https://github.com/ocornut/imgui): the settings interface and overlay controls.
+- [msvc-wine](https://github.com/mstorsjo/msvc-wine): the Linux build toolchain wrappers.
+- ArenaNet: Guild Wars and its game data. This project is unofficial and is not affiliated with ArenaNet or NCSOFT.
 
-## License
-
-MIT. See [LICENSE](LICENSE). The retained license credits Guild Wars Dev Hub, reflecting the GWToolbox++ codebase in which this plugin was developed.
-
-## Status
-
-This software interacts with live game and rendering state and should be treated as experimental. Back up your GWToolbox configuration before testing new releases.
+Released under the [MIT license](LICENSE). The original Guild Wars Dev Hub copyright notice is retained.

@@ -9,10 +9,12 @@ public:
     WorldCompletionPlugin() = default;
     ~WorldCompletionPlugin() override = default;
 
+    bool ShowOnWorldMap() const override { return true; }
     const char* Name() const override { return "World Completion"; }
 
     void Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODULE toolbox_dll) override;
     void SignalTerminate() override;
+    bool CanTerminate() override;
     void Update(float delta) override;
     void Draw(IDirect3DDevice9* pDevice) override;
     void DrawSettings() override;

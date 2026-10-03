@@ -5,3 +5,6 @@ bin/
 *.ilk
 *.exp
 *.lib
+.serena/
+__pycache__/
+core
