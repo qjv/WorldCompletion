@@ -33,6 +33,9 @@ add_library(WorldCompletion SHARED
     "${GWTOOLBOX_ROOT}/plugins/Base/ToolboxUIPlugin.cpp"
     "${GWTOOLBOX_ROOT}/GWToolboxdll/ToolboxIni.cpp"
     "${GWTOOLBOX_ROOT}/GWToolboxdll/Utils/SettingsDoc.cpp")
+file(GLOB PLUGIN_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/plugins/WorldCompletion/*.h")
+# Wine's compiler wrapper does not emit usable header dependencies for Ninja.
+set_property(SOURCE plugins/WorldCompletion/WorldCompletion.cpp APPEND PROPERTY OBJECT_DEPENDS "${PLUGIN_HEADERS}")
 target_compile_features(WorldCompletion PRIVATE cxx_std_23)
 set_target_properties(WorldCompletion PROPERTIES
     MSVC_RUNTIME_LIBRARY MultiThreaded

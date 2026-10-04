@@ -38,6 +38,8 @@ stubs = r"""
 #include <unordered_map>
 #include <unordered_set>
 #include "plugins/WorldCompletion/RoutePlanner.h"
+#include "plugins/WorldCompletion/VisitHistory.h"
+#include "plugins/WorldCompletion/PortalBarrier.h"
 #include "plugins/WorldCompletion/PortalLocations.h"
 namespace GW {
     struct Vec2f { float x = 0, y = 0; };
@@ -45,31 +47,94 @@ namespace GW {
     struct PathingTrapezoid { float XTL, XTR, YT, XBL, XBR, YB; };
     namespace Constants {
         enum class MapID { None };
-        enum class InstanceType { Loading };
+        enum class InstanceType { Loading, Explorable, Outpost };
+        enum class SkillID : uint32_t {};
+    }
+    struct Skill { uint32_t name = 0; };
+    struct Effect { Constants::SkillID skill_id; };
+    struct EffectArray : std::vector<Effect> {
+        bool available = true;
+        bool valid() const { return available; }
+    };
+    namespace Effects {
+        EffectArray effects;
+        EffectArray* GetPlayerEffects() { return &effects; }
+    }
+    namespace SkillbarMgr {
+        std::map<Constants::SkillID, Skill> skills;
+        const Skill* GetSkillConstantData(Constants::SkillID id) {
+            const auto found = skills.find(id);
+            return found == skills.end() ? nullptr : &found->second;
+        }
     }
 }
 struct ImRect { GW::Vec2f Min, Max; };
+namespace GW {
+    enum class RegionType { Outpost, Dungeon };
+    enum Region { Region_Kryta, Region_Presearing };
+    enum class Continent { Tyria, RealmOfTorment };
+    struct AreaInfo {
+        RegionType type = RegionType::Outpost;
+        Region region = Region_Kryta;
+        Continent continent = Continent::Tyria;
+        bool on_map = true, guild_hall = false;
+        bool GetIsOnWorldMap() const { return on_map; }
+        bool GetIsGuildHall() const { return guild_hall; }
+    };
+    namespace Map {
+        bool loaded = true;
+        Constants::InstanceType instance = Constants::InstanceType::Outpost;
+        uint32_t id = 1;
+        AreaInfo info;
+        bool GetIsMapLoaded() { return loaded; }
+        Constants::InstanceType GetInstanceType() { return instance; }
+        Constants::MapID GetMapID() { return static_cast<Constants::MapID>(id); }
+        const AreaInfo* GetMapInfo(Constants::MapID) { return &info; }
+    }
+}
+GW::Constants::MapID CartographyMapID() { return GW::Map::GetMapID(); }
+bool GetMapBounds(const GW::AreaInfo*, ImRect& bounds) { bounds = {{0, 0}, {64, 64}}; return true; }
+
 namespace CartographyData {
     struct Mask { int x0, y0, width, height, byte_count; const uint8_t* bits; };
 }
+uint8_t credit_bits = 1;
+CartographyData::Mask credit_mask{0, 0, 2, 2, 1, &credit_bits};
+const CartographyData::Mask* CreditableMask(const GW::AreaInfo*) { return &credit_mask; }
 constexpr float kGwinchesPerWorldUnit = 96.f;
 constexpr float kWorldUnitsPerCell = 32.f;
+std::vector<GW::GamePos> route;
+size_t route_progress = 0;
+std::vector<std::vector<uint32_t>> route_waypoint_reveals;
+std::vector<size_t> route_waypoint_indices;
+std::vector<bool> route_waypoint_visited;
+std::unordered_set<uint32_t> skipped_fog, explored_fog;
+bool FogIndexExplored(uint32_t fog) { return explored_fog.contains(fog); }
+bool history_dirty = false;
+completion::MapVisits* fixture_visits = nullptr;
+completion::MapVisits* CurrentVisits() { return fixture_visits; }
 """
 markers = [
-    "int FogCellX(", "int FogCellY(", "bool MaskContains(", "struct Candidate {",
+    "struct DiscoveryVisit {", "void RememberDiscovered(", "bool WaypointNeedsVisit(", "size_t CurrentRouteEnd(", "bool ReviewDiscovery(",
+    "uint32_t BirdsEyeViewEffect(",
+    "int FogCellX(", "int FogCellY(", "bool FogCellWithinBounds(", "bool DiscoveryCellAllowed(", "bool MaskContains(", "bool CompletionMapEligible(", "struct Candidate {",
     "bool Contains(", "GW::Vec2f ClosestPoint(", "GW::GamePos Centre(",
     "std::optional<completion::Portal> SharedPortal(", "size_t ClipHalfPlane(",
     "bool TrapezoidCellOverlap(", "struct Doorway {", "float DistanceToSegmentSq(",
-    "bool CrossesDoorway(", "bool IsBeyondKnownPortal(", "bool IsExplored(",
-    "struct SnapshotPlane {", "struct BuildSnapshot {", "struct BuildResult {",
+    "bool DoorwayBlocks(", "bool CrossesDoorway(", "bool IsBeyondKnownPortal(", "bool IsExplored(", "size_t ClosestRoutePointThrough(",
+    "bool PointerInArray(", "struct SnapshotPlane {", "struct BuildSnapshot {", "struct BuildResult {",
     "struct BuildCancelled {", "void BuildRoute(const BuildSnapshot &",
 ]
 with tempfile.TemporaryDirectory(prefix="worldcompletion-tests-") as temp:
     temp = Path(temp)
     fixture = temp / "snapshot.cpp"
-    fixture.write_text(stubs + "\n" + "\n\n".join(block(marker) for marker in markers)
+    fixture.write_text(stubs + "\n" + "\n\n".join(block(marker) +
+                       ("\nstd::vector<DiscoveryVisit> pending_discovery;" if marker == "struct DiscoveryVisit {" else "") for marker in markers)
                        + "\n" + (ROOT / "tests/snapshot_test.cpp").read_text())
-    for name, path in [("order", ROOT / "tests/route_planner_test.cpp"), ("snapshot", fixture)]:
+    for name, path in [("order", ROOT / "tests/route_planner_test.cpp"), ("snapshot", fixture),
+                       ("history", ROOT / "tests/visit_history_test.cpp"),
+                       ("navigation", ROOT / "tests/navigation_monitor_test.cpp"),
+                       ("portal", ROOT / "tests/portal_barrier_test.cpp")]:
         binary = temp / name
         subprocess.run(["g++", "-std=c++20", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(ROOT), str(path), "-o", str(binary)], check=True)

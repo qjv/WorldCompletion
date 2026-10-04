@@ -1,6 +1,9 @@
 #include "WorldCompletion.h"
 #include "PortalLocations.h"
 #include "RoutePlanner.h"
+#include "VisitHistory.h"
+#include "NavigationMonitor.h"
+#include "PortalBarrier.h"
 
 #include <chrono>
 #include <future>
@@ -22,16 +25,20 @@
 #include <vector>
 
 #include <GWCA/Context/MapContext.h>
+#include <GWCA/Context/CharContext.h>
 #include <GWCA/Context/GameplayContext.h>
 #include <GWCA/Context/WorldContext.h>
 #include <GWCA/GameEntities/Agent.h>
 #include <GWCA/GameEntities/Camera.h>
 #include <GWCA/GameEntities/Map.h>
 #include <GWCA/GameEntities/Pathing.h>
+#include <GWCA/GameEntities/Skill.h>
 #include <GWCA/Managers/AgentMgr.h>
 #include <GWCA/Managers/CameraMgr.h>
+#include <GWCA/Managers/EffectMgr.h>
 #include <GWCA/Managers/MapMgr.h>
 #include <GWCA/Managers/RenderMgr.h>
+#include <GWCA/Managers/SkillbarMgr.h>
 #include <GWCA/Managers/UIMgr.h>
 
 #include <Widgets/CartographyData.h>
@@ -47,6 +54,18 @@ namespace {
     int FogCellY(const float world_y)
     {
         return static_cast<int>(ceilf(world_y / kWorldUnitsPerCell)) - 1;
+    }
+
+    bool FogCellWithinBounds(const ImRect &bounds, const int cx, const int cy)
+    {
+        const float x = cx * kWorldUnitsPerCell, y = cy * kWorldUnitsPerCell;
+        return x < bounds.Max.x && x + kWorldUnitsPerCell > bounds.Min.x &&
+               y < bounds.Max.y && y + kWorldUnitsPerCell > bounds.Min.y;
+    }
+
+    bool DiscoveryCellAllowed(const ImRect &bounds, const int cx, const int cy, const int dx, const int dy, const bool include_outside = true)
+    {
+        return FogCellWithinBounds(bounds, cx, cy) || (include_outside && abs(dx) <= 1 && abs(dy) <= 1);
     }
 
     bool MaskContains(const CartographyData::Mask *mask, const int cx, const int cy)
@@ -73,6 +92,7 @@ namespace {
         const GW::PathingTrapezoid *trap = nullptr;
         std::vector<uint32_t> reveals;
         float footing_area = 0.f;
+        bool preserved = false;
         int cell_x = 0;
         int cell_y = 0;
     };
@@ -99,11 +119,31 @@ namespace {
     uint32_t route_colour = IM_COL32(255, 145, 35, 245);
     int optimization_quality = 1;
     int relaxation_passes = 8;
+    bool birds_eye_compass = false;
+    bool include_outside_squares = false;
+    uint32_t birds_eye_effect_id = 0;
+    float waypoint_entry_margin = 192.f;
+
+    uint32_t BirdsEyeViewEffect()
+    {
+        constexpr auto known_id = static_cast<GW::Constants::SkillID>(3439);
+        const auto *effects = GW::Effects::GetPlayerEffects();
+        if (!effects || !effects->valid()) return 0;
+        const auto *known = GW::SkillbarMgr::GetSkillConstantData(known_id);
+        for (const auto &effect : *effects) {
+            if (effect.skill_id == known_id) return static_cast<uint32_t>(effect.skill_id);
+            const auto *skill = known && known->name ? GW::SkillbarMgr::GetSkillConstantData(effect.skill_id) : nullptr;
+            // Alternate versions can share the same effect name without sharing a skill ID.
+            if (skill && skill->name == known->name) return static_cast<uint32_t>(effect.skill_id);
+        }
+        return 0;
+    }
     int randomized_restarts = 12;
     int end_portal_index = -1;
     uint32_t end_portal_map = 0;
     uint32_t resume_after = 0;
     uint32_t last_rebuild = 0;
+    completion::NavigationMonitor navigation_monitor;
     uint32_t last_fog_check = 0;
     int useful_candidates = 0;
     int unexplored_reachable = 0;
@@ -145,6 +185,109 @@ namespace {
     size_t route_progress = 0;
     size_t ground_progress = 0;
     std::optional<GW::GamePos> route_end_portal_point;
+    std::unordered_set<uint32_t> skipped_fog;
+    std::vector<bool> route_waypoint_visited;
+    struct DiscoveryVisit {
+        std::vector<uint32_t> fog;
+        uint32_t since = 0;
+        bool Ready(const uint32_t now) const
+        {
+            return now - since >= 2500;
+        }
+    };
+    std::vector<DiscoveryVisit> pending_discovery;
+    completion::VisitHistory visit_history;
+    std::filesystem::path visit_history_path;
+    std::future<bool> visit_history_save;
+    std::string history_character, history_status = "Ready";
+    uint32_t history_map = 0, history_width = 0, last_history_save = 0;
+    bool history_dirty = false, history_save_failed = false;
+    bool history_scan_pending = false, history_scan_setup = false;
+    int history_scan_x = 0, history_scan_y = 0, history_scan_x0 = 0, history_scan_x1 = 0, history_scan_y1 = 0;
+
+    completion::MapVisits *CurrentVisits()
+    {
+        if (history_character.empty() || !history_width) return nullptr;
+        return &visit_history.For(history_character, history_map, history_width);
+    }
+
+    void PollVisitHistorySave()
+    {
+        if (!visit_history_save.valid() || visit_history_save.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        history_save_failed = !visit_history_save.get();
+        if (history_save_failed) history_dirty = true;
+        history_status = history_save_failed ? "Save failed; history is still in memory" : "Saved";
+    }
+
+    void SaveVisitHistory()
+    {
+        PollVisitHistorySave();
+        if (!history_dirty || visit_history_save.valid() || visit_history_path.empty()) return;
+        const auto path = visit_history_path;
+        auto snapshot = visit_history;
+        history_dirty = false;
+        history_save_failed = false;
+        last_history_save = GetTickCount();
+        history_status = "Saving";
+        visit_history_save = std::async(std::launch::async, [path, snapshot = std::move(snapshot)] {
+            try {
+                const auto bytes = snapshot.Encode();
+                auto temporary = path;
+                temporary += L".tmp";
+                std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+                out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                out.close();
+                return !out.fail() && MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+            }
+            catch (...) { return false; }
+        });
+    }
+
+    void LoadVisitHistory(const std::filesystem::path &folder)
+    {
+        if (!visit_history_path.empty()) return;
+        visit_history_path = folder / L"WorldCompletion.visits";
+        try {
+            std::ifstream in(visit_history_path, std::ios::binary | std::ios::ate);
+            if (!in) return;
+            const auto length = in.tellg();
+            if (length < 0 || length > 32 * 1024 * 1024) {
+                history_status = "Invalid history file; starting fresh";
+                return;
+            }
+            std::vector<uint8_t> bytes(static_cast<size_t>(length));
+            in.seekg(0);
+            in.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            if (!in || !visit_history.Decode(bytes)) history_status = "Invalid history file; starting fresh";
+        }
+        catch (...) { history_status = "Could not read history"; }
+    }
+
+    void UpdateVisitContext()
+    {
+        const auto *character = GW::GetCharContext();
+        const auto *world = GW::GetWorldContext();
+        if (!character || !world || !world->cartographed_areas.valid()) return;
+        const auto end = std::find(std::begin(character->player_name), std::end(character->player_name), L'\0');
+        const int length = static_cast<int>(end - std::begin(character->player_name));
+        const int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, character->player_name, length, nullptr, 0, nullptr, nullptr);
+        if (bytes <= 0) return;
+        std::string name(static_cast<size_t>(bytes), '\0');
+        if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, character->player_name, length, name.data(), bytes, nullptr, nullptr)) return;
+        const auto map = static_cast<uint32_t>(GW::Map::GetMapID());
+        const uint32_t width = world->h05B4[0];
+        if (!width || width % 32) return;
+        if (name == history_character && map == history_map && width == history_width) return;
+        SaveVisitHistory();
+        history_character = std::move(name);
+        history_map = map;
+        history_width = width;
+        history_scan_pending = true;
+        history_scan_setup = false;
+        skipped_fog.clear();
+        if (const auto *record = CurrentVisits())
+            for (const auto fog : record->skipped) skipped_fog.insert(static_cast<uint32_t>(fog));
+    }
 
     GW::Constants::MapID CartographyMapID();
 
@@ -156,6 +299,7 @@ namespace {
         ground_building = false;
         route_waypoints.clear();
         route_waypoint_reveals.clear();
+        route_waypoint_visited.clear();
         route_waypoint_narrow.clear();
         route_waypoint_altitudes.clear();
         ground_route.clear();
@@ -174,7 +318,13 @@ namespace {
     void SuspendRoute(const uint32_t now)
     {
         CancelBuild();
+        navigation_monitor.Reset();
         ClearRouteState();
+        skipped_fog.clear();
+        history_character.clear();
+        history_width = 0;
+        history_scan_pending = false;
+        pending_discovery.clear();
         if (route_state_block) {
             route_state_block->Release();
             route_state_block = nullptr;
@@ -238,6 +388,35 @@ namespace {
             }
         }
         return cached_display;
+    }
+
+    bool CompletionMapEligible()
+    {
+        const auto instance = GW::Map::GetInstanceType();
+        if (!GW::Map::GetIsMapLoaded() ||
+            (instance != GW::Constants::InstanceType::Explorable && instance != GW::Constants::InstanceType::Outpost)) return false;
+        const auto *actual = GW::Map::GetMapInfo(GW::Map::GetMapID());
+        const auto *display = GW::Map::GetMapInfo(CartographyMapID());
+        if (!actual || !display || !actual->GetIsOnWorldMap() || actual->GetIsGuildHall() ||
+            actual->type == GW::RegionType::Dungeon || actual->region == GW::Region_Presearing ||
+            actual->continent == GW::Continent::RealmOfTorment) return false;
+        const auto *mask = CreditableMask(display);
+        ImRect bounds;
+        if (!mask || !GetMapBounds(actual, bounds)) return false;
+        static GW::Constants::MapID checked_map = GW::Constants::MapID::None;
+        static bool eligible = false;
+        const auto map = GW::Map::GetMapID();
+        if (checked_map == map) return eligible;
+        checked_map = map;
+        eligible = false;
+        const int x0 = std::max(mask->x0, static_cast<int>(floorf(bounds.Min.x / kWorldUnitsPerCell)));
+        const int y0 = std::max(mask->y0, static_cast<int>(floorf(bounds.Min.y / kWorldUnitsPerCell)));
+        const int x1 = std::min(mask->x0 + mask->width, static_cast<int>(ceilf(bounds.Max.x / kWorldUnitsPerCell)));
+        const int y1 = std::min(mask->y0 + mask->height, static_cast<int>(ceilf(bounds.Max.y / kWorldUnitsPerCell)));
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                if (MaskContains(mask, x, y)) return eligible = true;
+        return false;
     }
 
     bool GameToWorld(const GW::GamePos &game, GW::Vec2f &world, const GW::Constants::MapID display_map)
@@ -334,7 +513,7 @@ namespace {
     }
 
     bool TrapezoidCellOverlap(const GW::PathingTrapezoid *trap, const GW::Vec2f &box_min, const GW::Vec2f &box_max, GW::Vec2f &footing,
-                              float &overlap_area, const GW::Vec2f *preferred = nullptr)
+                              float &overlap_area, const GW::Vec2f *preferred = nullptr, const float entry_margin = 192.f)
     {
         if (!trap || std::min(trap->XTL, trap->XBL) > box_max.x || std::max(trap->XTR, trap->XBR) < box_min.x || trap->YB > box_max.y ||
             trap->YT < box_min.y)
@@ -388,7 +567,7 @@ namespace {
             }
             // Stay slightly inside the reveal cell; scale the margin down for tiny slivers.
             const float distance = hypotf(footing.x - closest.x, footing.y - closest.y);
-            const float inset = distance > 0.f ? std::min(32.f / distance, .25f) : 0.f;
+            const float inset = distance > 0.f ? std::min(entry_margin / distance, .5f) : 0.f;
             footing = {closest.x + inset * (footing.x - closest.x), closest.y + inset * (footing.y - closest.y)};
         }
         return true;
@@ -397,6 +576,8 @@ namespace {
     struct Doorway {
         GW::Vec2f pos{};
         float radius_sq = 0.f;
+        std::optional<completion::Portal> barrier;
+        uint32_t plane = UINT32_MAX;
     };
 
     uint32_t FileHashToFileId(const wchar_t *hash)
@@ -474,7 +655,8 @@ namespace {
             else {
                 // A matching live prop often reports only the model cylinder,
                 // which is much narrower than the complete zoning threshold.
-                existing->pos = {endpoint.x, endpoint.y};
+                // Keep the live portal position for wall tracing; endpoint data
+                // describes a spawn location beyond the actual threshold.
                 existing->radius_sq = std::max(existing->radius_sq, endpoint_radius * endpoint_radius);
             }
         }
@@ -490,18 +672,29 @@ namespace {
         return ox * ox + oy * oy;
     }
 
-    bool CrossesDoorway(const std::vector<Doorway> &doors, const GW::PathingTrapezoid *a, const GW::PathingTrapezoid *b)
+    bool DoorwayBlocks(const Doorway &door, const GW::Vec2f &a, const GW::Vec2f &b, const uint32_t plane = UINT32_MAX)
+    {
+        if (plane != UINT32_MAX && door.plane != UINT32_MAX && plane != door.plane) return false;
+        if (door.barrier)
+            return completion::BarrierSegmentDistanceSq({a.x, a.y}, {b.x, b.y}, door.barrier->first, door.barrier->second) <= 48.f * 48.f;
+        return DistanceToSegmentSq(door.pos, a, b) < door.radius_sq;
+    }
+
+    bool CrossesDoorway(const std::vector<Doorway> &doors, const GW::PathingTrapezoid *a, const GW::PathingTrapezoid *b, const uint32_t plane = UINT32_MAX)
     {
         const auto ca = Centre(a), cb = Centre(b);
         return std::ranges::any_of(
-            doors, [&](const Doorway &door) { return DistanceToSegmentSq(door.pos, {ca.x, ca.y}, {cb.x, cb.y}) < door.radius_sq; });
+            doors, [&](const Doorway &door) { return DoorwayBlocks(door, {ca.x, ca.y}, {cb.x, cb.y}, plane); });
     }
 
-    bool IsBeyondKnownPortal(const GW::Vec2f &point, const GW::Vec2f &map_min, const GW::Vec2f &map_max, const uint32_t map_id)
+    bool IsBeyondKnownPortal(const GW::Vec2f &point, const GW::Vec2f &map_min, const GW::Vec2f &map_max, const uint32_t map_id, const std::vector<Doorway> *doors = nullptr)
     {
         constexpr float half_width = 4000.f;
         for (const auto &endpoint : world_completion_portals::locations) {
             if (endpoint.map_id != map_id) continue;
+            if (doors && std::ranges::any_of(*doors, [&](const Doorway &door) {
+                return door.barrier && hypotf(door.pos.x - endpoint.x, door.pos.y - endpoint.y) < 1800.f;
+            })) continue;
             const float distances[4] = {fabsf(endpoint.x - map_min.x), fabsf(endpoint.x - map_max.x), fabsf(endpoint.y - map_min.y),
                                         fabsf(endpoint.y - map_max.y)};
             const size_t side = static_cast<size_t>(std::min_element(std::begin(distances), std::end(distances)) - distances);
@@ -528,6 +721,45 @@ namespace {
         const auto *bits = reinterpret_cast<const uint32_t *>(world->cartographed_areas.m_buffer);
         const uint32_t word = fog >> 5;
         return word < world->cartographed_areas.size() && ((bits[word] >> (fog & 31)) & 1u) != 0;
+    }
+
+    void RememberDiscovered(const uint32_t fog)
+    {
+        if (auto *record = CurrentVisits()) {
+            history_dirty |= record->discovered.insert(fog).second;
+            history_dirty |= record->skipped.erase(fog) != 0;
+            skipped_fog.erase(fog);
+        }
+    }
+
+    void ScanDiscoveredHistory()
+    {
+        if (!history_scan_pending) return;
+        const auto *world = GW::GetWorldContext();
+        if (!world || !world->cartographed_areas.valid() || !CurrentVisits() || !world->h05B4[1]) return;
+        if (!history_scan_setup) {
+            ImRect limits;
+            if (!GetMapBounds(GW::Map::GetMapInfo(GW::Map::GetMapID()), limits) &&
+                !GetMapBounds(GW::Map::GetMapInfo(CartographyMapID()), limits)) return;
+            history_scan_x0 = std::max(0, static_cast<int>(floorf(limits.Min.x / kWorldUnitsPerCell)) - 1);
+            history_scan_x1 = std::min(static_cast<int>(history_width), static_cast<int>(ceilf(limits.Max.x / kWorldUnitsPerCell)) + 1);
+            history_scan_x = history_scan_x0;
+            history_scan_y = std::max(0, static_cast<int>(floorf(limits.Min.y / kWorldUnitsPerCell)) - 1);
+            history_scan_y1 = std::min(static_cast<int>(world->h05B4[1]), static_cast<int>(ceilf(limits.Max.y / kWorldUnitsPerCell)) + 1);
+            history_scan_setup = true;
+        }
+        const auto *bits = reinterpret_cast<const uint32_t *>(world->cartographed_areas.m_buffer);
+        for (int budget = 0; budget < 512 && history_scan_y < history_scan_y1; ++budget) {
+            if (history_scan_x >= history_scan_x1) {
+                history_scan_x = history_scan_x0;
+                ++history_scan_y;
+                continue;
+            }
+            const auto fog = static_cast<uint32_t>(history_scan_y) * history_width + static_cast<uint32_t>(history_scan_x++);
+            const uint32_t word = fog >> 5;
+            if (word < world->cartographed_areas.size() && ((bits[word] >> (fog & 31)) & 1u)) RememberDiscovered(fog);
+        }
+        if (history_scan_y >= history_scan_y1) history_scan_pending = false;
     }
 
     void UpdateGroundRoute()
@@ -560,9 +792,12 @@ namespace {
 
     size_t ClosestRoutePointThrough(const GW::GamePos &player, const size_t last)
     {
-        size_t closest = std::min(route_progress, route.size() - 1);
+        if (route.empty()) return 0;
+        // Keep the final approach visible until the waypoint's fog is actually revealed.
+        const size_t limit = std::min(last ? last - 1 : 0, route.size() - 1);
+        size_t closest = std::min(route_progress, limit);
         float closest_distance = FLT_MAX;
-        for (size_t i = closest; i <= std::min(last, route.size() - 1); i++) {
+        for (size_t i = closest; i <= limit; i++) {
             if (route[i].zplane != player.zplane && (!i || route[i - 1].zplane != player.zplane)) continue;
             const float dx = route[i].x - player.x, dy = route[i].y - player.y;
             const float distance = dx * dx + dy * dy;
@@ -573,13 +808,43 @@ namespace {
         return closest;
     }
 
+    bool WaypointNeedsVisit(const size_t i)
+    {
+        return i < route_waypoint_reveals.size() && !(i < route_waypoint_visited.size() && route_waypoint_visited[i]) &&
+               std::ranges::any_of(route_waypoint_reveals[i], [](const uint32_t fog) { return !FogIndexExplored(fog); });
+    }
+
     size_t CurrentRouteEnd()
     {
         for (size_t i = 0; i < route_waypoint_reveals.size(); ++i) {
-            if (std::ranges::any_of(route_waypoint_reveals[i], [](const uint32_t fog) { return !FogIndexExplored(fog); }))
+            if (WaypointNeedsVisit(i))
                 return route_waypoint_indices[i];
         }
         return route.empty() ? 0 : route.size() - 1;
+    }
+
+    bool ReviewDiscovery(const uint32_t now)
+    {
+        bool changed = false;
+        std::unordered_set<uint32_t> covered_later;
+        if (std::ranges::any_of(pending_discovery, [&](const DiscoveryVisit &visit) { return visit.Ready(now); })) {
+            for (size_t i = 0; i < route_waypoint_reveals.size(); ++i) {
+                if (WaypointNeedsVisit(i)) covered_later.insert(route_waypoint_reveals[i].begin(), route_waypoint_reveals[i].end());
+            }
+        }
+        std::erase_if(pending_discovery, [&](const DiscoveryVisit &visit) {
+            if (std::ranges::all_of(visit.fog, FogIndexExplored)) return true;
+            if (!visit.Ready(now)) return false;
+            for (const uint32_t fog : visit.fog) {
+                if (FogIndexExplored(fog)) continue;
+                if (!covered_later.contains(fog) && skipped_fog.insert(fog).second) {
+                    changed = true;
+                    if (auto *record = CurrentVisits()) history_dirty |= record->skipped.insert(fog).second;
+                }
+            }
+            return true;
+        });
+        return changed;
     }
 
     size_t CurrentGroundEnd()
@@ -590,9 +855,11 @@ namespace {
 
     size_t ClosestGroundPoint(const GW::Vec3f &player)
     {
-        size_t closest = std::min(ground_progress, ground_route.size() - 1);
+        if (ground_route.empty()) return 0;
+        const size_t end = CurrentGroundEnd();
+        const size_t last = std::min(end ? end - 1 : 0, ground_route.size() - 1);
+        size_t closest = std::min(ground_progress, last);
         float closest_distance = FLT_MAX;
-        const size_t last = std::min(CurrentGroundEnd(), ground_route.size() - 1);
         for (size_t i = closest; i <= last; ++i) {
             const float dx = ground_route[i].x - player.x, dy = ground_route[i].y - player.y;
             const float dz = ground_route[i].z + 48.f - player.z;
@@ -604,8 +871,16 @@ namespace {
         return closest;
     }
 
+    bool PointerInArray(const uintptr_t pointer, const uintptr_t start, const size_t count, const size_t stride)
+    {
+        return pointer && start && stride && pointer >= start &&
+               (pointer - start) % stride == 0 && (pointer - start) / stride < count;
+    }
+
     struct SnapshotPlane {
         uint32_t trapezoid_count = 0;
+        uintptr_t source_trapezoids = 0, source_portals = 0;
+        uint32_t source_portal_count = 0;
         bool blocked = false;
         std::vector<GW::PathingTrapezoid> trapezoids;
         std::vector<uintptr_t> addresses;
@@ -618,14 +893,22 @@ namespace {
         std::vector<Doorway> doorways;
         std::vector<GW::Vec2f> endpoints;
         GW::GamePos player{};
+        std::vector<GW::GamePos> previous_waypoints;
         GW::Vec2f anchor{};
         ImRect bounds;
         const CartographyData::Mask *mask = nullptr;
+        ImRect discovery_bounds;
         GW::Constants::MapID map = GW::Constants::MapID::None;
         GW::Constants::InstanceType instance = GW::Constants::InstanceType::Loading;
         uint32_t width = 0, height = 0;
         int quality = 1, relaxation = 0, restarts = 0, end_portal = -1;
+        int reveal_radius = 1;
+        bool include_outside = false;
+        float entry_margin = 192.f;
+        std::unordered_set<uint32_t> skipped;
+        std::set<uint64_t> confirmed_fog;
         size_t capture_plane = 0, capture_trap = 0;
+        uintptr_t source_context = 0;
     };
 
     struct BuildResult {
@@ -660,16 +943,52 @@ namespace {
         return capture || build_future.valid();
     }
 
+    void CheckNavigationChanges(const uint32_t now)
+    {
+        if (!navigation_monitor.Due(now) || transition_event.load(std::memory_order_acquire) || !CompletionMapEligible()) return;
+        const auto *context = GW::GetMapContext();
+        const auto *maps = GW::Map::GetPathingMap();
+        if (!context || !maps || !maps->valid()) return;
+        // Ignore buffer replacement and closures: only additional walkable
+        // geometry or an opening connection warrants an automatic rebuild.
+        completion::NavigationState state;
+        for (size_t p = 0; p < maps->size(); ++p) {
+            const auto &plane = (*maps)[p];
+            const bool blocked = context->path && p < context->path->blockedPlanes.size() && (context->path->blockedPlanes[p] & 1);
+            state.walkable_trapezoids.push_back(blocked ? 0 : plane.trapezoid_count);
+            if (!plane.portals) continue;
+            for (uint32_t i = 0; i < plane.portal_count; ++i) {
+                const auto &portal = plane.portals[i];
+                state.open_portals.push_back(!blocked && !(portal.flags & 4) && portal.pair && portal.count);
+            }
+        }
+        if (!navigation_monitor.Observe(std::move(state), now)) return;
+        CancelBuild();
+        recompute_requested.store(true, std::memory_order_release);
+        // A previously failed discovery may become reachable when a bridge opens.
+        skipped_fog.clear();
+        if (auto *record = CurrentVisits(); record && !record->skipped.empty()) {
+            record->skipped.clear();
+            history_dirty = true;
+        }
+        build_status = "New walkable terrain; extending route";
+    }
+
     bool BeginCapture()
     {
+        if (transition_event.load(std::memory_order_acquire) || !CompletionMapEligible()) return false;
         const auto *maps = GW::Map::GetPathingMap();
         const auto *context = GW::GetMapContext();
         const auto *world = GW::GetWorldContext();
         const auto *player = GW::Agents::GetControlledCharacter();
         if (!maps || !maps->valid() || !context || !world || !player || !world->cartographed_areas.valid()) return false;
+        CheckNavigationChanges(GetTickCount());
         auto snapshot = std::make_unique<BuildSnapshot>();
         const auto *info = GW::Map::GetMapInfo(CartographyMapID());
         if (!GetMapBounds(info, snapshot->bounds)) return false;
+        // Coordinate placement can use a mission's paired map; discovery stays in the loaded area.
+        if (!GetMapBounds(GW::Map::GetMapInfo(GW::Map::GetMapID()), snapshot->discovery_bounds))
+            snapshot->discovery_bounds = snapshot->bounds;
         snapshot->anchor = {snapshot->bounds.Min.x - context->start_pos.x / kGwinchesPerWorldUnit,
                             snapshot->bounds.Min.y + context->end_pos.y / kGwinchesPerWorldUnit + 1.f};
         snapshot->mask = CreditableMask(info);
@@ -677,13 +996,26 @@ namespace {
         snapshot->instance = GW::Map::GetInstanceType();
         snapshot->quality = optimization_quality;
         snapshot->relaxation = relaxation_passes;
+        snapshot->reveal_radius = birds_eye_compass ? 3 : 1;
+        snapshot->include_outside = include_outside_squares;
+        snapshot->entry_margin = waypoint_entry_margin;
+        snapshot->skipped = skipped_fog;
+        for (size_t i = 0; i < route_waypoints.size(); ++i)
+            if (WaypointNeedsVisit(i)) snapshot->previous_waypoints.push_back(route_waypoints[i]);
+        if (const auto *record = CurrentVisits()) snapshot->confirmed_fog = record->discovered;
+        for (const auto &visit : pending_discovery)
+            snapshot->skipped.insert(visit.fog.begin(), visit.fog.end());
         snapshot->restarts = randomized_restarts;
         snapshot->end_portal = end_portal_map == static_cast<uint32_t>(snapshot->map) ? end_portal_index : -1;
         snapshot->doorways = GetBlockedDoorways(context);
         snapshot->endpoints = CurrentPortalEndpoints();
+        snapshot->source_context = reinterpret_cast<uintptr_t>(context);
         snapshot->maps.resize(maps->size());
         for (size_t i = 0; i < maps->size(); ++i) {
             snapshot->maps[i].trapezoid_count = (*maps)[i].trapezoid_count;
+            snapshot->maps[i].source_trapezoids = reinterpret_cast<uintptr_t>((*maps)[i].trapezoids);
+            snapshot->maps[i].source_portals = reinterpret_cast<uintptr_t>((*maps)[i].portals);
+            snapshot->maps[i].source_portal_count = (*maps)[i].portal_count;
             snapshot->maps[i].blocked = context->path && i < context->path->blockedPlanes.size() && (context->path->blockedPlanes[i] & 1);
         }
         capture = std::move(snapshot);
@@ -693,9 +1025,15 @@ namespace {
 
     bool ContinueCapture()
     {
+        if (!capture || transition_event.load(std::memory_order_acquire) || !CompletionMapEligible() ||
+            capture->map != GW::Map::GetMapID() || capture->instance != GW::Map::GetInstanceType()) {
+            CancelBuild();
+            return false;
+        }
         const auto *maps = GW::Map::GetPathingMap();
         const auto *context = GW::GetMapContext();
-        if (!maps || !maps->valid() || maps->size() != capture->maps.size() || !context) {
+        if (!maps || !maps->valid() || maps->size() != capture->maps.size() || !context ||
+            reinterpret_cast<uintptr_t>(context) != capture->source_context) {
             CancelBuild();
             return false;
         }
@@ -704,7 +1042,9 @@ namespace {
             const auto plane_index = capture->capture_plane;
             const auto &source = (*maps)[plane_index];
             auto &dest = capture->maps[plane_index];
-            if (source.trapezoid_count != dest.trapezoid_count || (source.trapezoid_count && !source.trapezoids)) {
+            if (reinterpret_cast<uintptr_t>(source.portals) != dest.source_portals || source.portal_count != dest.source_portal_count ||
+                reinterpret_cast<uintptr_t>(source.trapezoids) != dest.source_trapezoids ||
+                source.trapezoid_count != dest.trapezoid_count || (source.trapezoid_count && !source.trapezoids)) {
                 CancelBuild();
                 return false;
             }
@@ -725,7 +1065,18 @@ namespace {
                 for (const auto index : {trap->portal_left, trap->portal_right}) {
                     if (index >= source.portal_count || !source.portals) continue;
                     const auto &portal = source.portals[index];
-                    if ((portal.flags & 4) || !portal.pair || !portal.pair->trapezoids) continue;
+                    if ((portal.flags & 4) || !portal.pair) continue;
+                    // Only dereference portal links owned by a current mesh plane.
+                    bool live_pair = false;
+                    for (size_t p = 0; p < maps->size(); ++p) {
+                        const auto &plane = (*maps)[p];
+                        if (PointerInArray(reinterpret_cast<uintptr_t>(portal.pair), reinterpret_cast<uintptr_t>(plane.portals),
+                                           plane.portal_count, sizeof(GW::Portal))) {
+                            live_pair = true;
+                            break;
+                        }
+                    }
+                    if (!live_pair || !portal.pair->trapezoids) continue;
                     if (context->path && portal.neighbor_plane < context->path->blockedPlanes.size() &&
                         (context->path->blockedPlanes[portal.neighbor_plane] & 1))
                         continue;
@@ -763,6 +1114,7 @@ namespace {
         const int quality = std::clamp(snapshot.quality, 0, 2);
         const int two_opt_passes = std::array{8, 16, 24}[quality];
         const int relaxation_budget = snapshot.relaxation;
+        const int reveal_radius = std::clamp(snapshot.reveal_radius, 1, 3);
         const int restart_budget = snapshot.restarts;
         struct Player {
             GW::GamePos pos;
@@ -847,9 +1199,45 @@ namespace {
             }
         }
         std::vector<Doorway> path_doorways = snapshot.doorways;
+        for (auto &door : path_doorways) {
+            check();
+            float closest = 1800.f * 1800.f;
+            GW::Vec2f anchor = door.pos;
+            const GW::PathingTrapezoid *anchor_trap = nullptr;
+            for (size_t p = 0; p < maps->size(); ++p) {
+                if ((*maps)[p].blocked) continue;
+                for (const auto &trap : (*maps)[p].trapezoids) {
+                    check();
+                    const auto point = Contains(&trap, door.pos) ? door.pos : ClosestPoint(&trap, door.pos);
+                    const float dx = point.x - door.pos.x, dy = point.y - door.pos.y;
+                    const float distance = dx * dx + dy * dy;
+                    if (distance >= closest) continue;
+                    closest = distance;
+                    anchor = point;
+                    anchor_trap = &trap;
+                    door.plane = static_cast<uint32_t>(p);
+                }
+            }
+            if (!anchor_trap) continue;
+            if (closest > 0.f) {
+                const auto center = Centre(anchor_trap);
+                const float length = hypotf(center.x - anchor.x, center.y - anchor.y);
+                const float inset = length > 0.f ? std::min(192.f / length, .5f) : 0.f;
+                anchor = {anchor.x + (center.x - anchor.x) * inset, anchor.y + (center.y - anchor.y) * inset};
+            }
+            std::vector<completion::WalkPolygon> polygons;
+            for (const auto &trap : (*maps)[door.plane].trapezoids) {
+                check();
+                if (std::max(trap.XTR, trap.XBR) < anchor.x - 6000.f || std::min(trap.XTL, trap.XBL) > anchor.x + 6000.f ||
+                    trap.YT < anchor.y - 6000.f || trap.YB > anchor.y + 6000.f) continue;
+                polygons.push_back({completion::Point{trap.XTL, trap.YT}, {trap.XTR, trap.YT}, {trap.XBR, trap.YB}, {trap.XBL, trap.YB}});
+            }
+            door.barrier = completion::TracePortalBarrier({anchor.x, anchor.y}, polygons, check);
+        }
+
         std::erase_if(path_doorways, [&](const Doorway &door) {
             const float dx = player->pos.x - door.pos.x, dy = player->pos.y - door.pos.y;
-            return dx * dx + dy * dy < door.radius_sq;
+            return door.barrier ? DoorwayBlocks(door, player_pos, player_pos, player->pos.zplane) : dx * dx + dy * dy < door.radius_sq;
         });
         const auto add_edge = [&](const GW::PathingTrapezoid *a, const GW::PathingTrapezoid *b) {
             auto &from = graph[a];
@@ -863,7 +1251,7 @@ namespace {
             queue.pop_front();
             for (const auto *adjacent : snapshot_graph[t]) {
                 check();
-                if (CrossesDoorway(path_doorways, t, adjacent)) continue;
+                if (CrossesDoorway(path_doorways, t, adjacent, static_cast<uint32_t>(planes.at(t)))) continue;
                 add_edge(t, adjacent);
                 if (reachable.insert(adjacent).second) queue.push_back(adjacent);
             }
@@ -895,15 +1283,18 @@ namespace {
                     check();
                     for (int cx = cell_x0; cx <= cell_x1; cx++) {
                         check();
+                        if (!FogCellWithinBounds(snapshot.discovery_bounds, cx, cy)) continue;
                         GW::Vec2f game_a, game_b, footing;
-                        if (!world_to_game({cx * kWorldUnitsPerCell, cy * kWorldUnitsPerCell}, game_a, display_map) ||
-                            !world_to_game({(cx + 1) * kWorldUnitsPerCell, (cy + 1) * kWorldUnitsPerCell}, game_b, display_map))
+                        if (!world_to_game({std::max(cx * kWorldUnitsPerCell, snapshot.discovery_bounds.Min.x),
+                                            std::max(cy * kWorldUnitsPerCell, snapshot.discovery_bounds.Min.y)}, game_a, display_map) ||
+                            !world_to_game({std::min((cx + 1) * kWorldUnitsPerCell, snapshot.discovery_bounds.Max.x),
+                                            std::min((cy + 1) * kWorldUnitsPerCell, snapshot.discovery_bounds.Max.y)}, game_b, display_map))
                             continue;
                         const GW::Vec2f box_min{std::min(game_a.x, game_b.x), std::min(game_a.y, game_b.y)};
                         const GW::Vec2f box_max{std::max(game_a.x, game_b.x), std::max(game_a.y, game_b.y)};
                         float overlap_area = 0.f;
                         if (!TrapezoidCellOverlap(t, box_min, box_max, footing, overlap_area)) continue;
-                        if (IsBeyondKnownPortal(footing, path_min, path_max, static_cast<uint32_t>(snapshot.map))) continue;
+                        if (IsBeyondKnownPortal(footing, path_min, path_max, static_cast<uint32_t>(snapshot.map), &path_doorways)) continue;
                         const auto key = std::pair{cx, cy};
                         const auto existing = by_cell.find(key);
                         Candidate candidate;
@@ -912,13 +1303,16 @@ namespace {
                         candidate.footing_area = overlap_area;
                         candidate.cell_x = cx;
                         candidate.cell_y = cy;
-                        for (int dy = -1; dy <= 1; dy++) {
+                        for (int dy = -reveal_radius; dy <= reveal_radius; dy++) {
                             check();
-                            for (int dx = -1; dx <= 1; dx++) {
+                            for (int dx = -reveal_radius; dx <= reveal_radius; dx++) {
                                 check();
                                 const int fog_x = cx + dx, fog_y = cy + dy;
-                                if (!IsExplored(bits, width, height, words, fog_x, fog_y) && MaskContains(creditable_mask, fog_x, fog_y))
-                                    candidate.reveals.push_back(static_cast<uint32_t>(fog_y) * width + static_cast<uint32_t>(fog_x));
+                                if (!DiscoveryCellAllowed(snapshot.discovery_bounds, fog_x, fog_y, dx, dy, snapshot.include_outside)) continue;
+                                if (IsExplored(bits, width, height, words, fog_x, fog_y) || !MaskContains(creditable_mask, fog_x, fog_y)) continue;
+                                const uint32_t fog = static_cast<uint32_t>(fog_y) * width + static_cast<uint32_t>(fog_x);
+                                if (snapshot.skipped.contains(fog) || snapshot.confirmed_fog.contains(fog)) continue;
+                                candidate.reveals.push_back(fog);
                             }
                         }
                         auto &options = footing_options[key];
@@ -944,6 +1338,26 @@ namespace {
             for (const auto fog : candidate.reveals)
                 remaining.insert(fog);
             candidates.push_back(std::move(candidate));
+        }
+        // Carry useful stops forward at their exact positions. Revalidate them
+        // against the new mesh, zone bounds and remaining discovery targets.
+        for (const auto &point : snapshot.previous_waypoints) {
+            check();
+            GW::Vec2f world;
+            if (!game_to_world(point, world, display_map)) continue;
+            const int cx = FogCellX(world.x), cy = FogCellY(world.y);
+            if (world.x < snapshot.discovery_bounds.Min.x || world.x >= snapshot.discovery_bounds.Max.x ||
+                world.y < snapshot.discovery_bounds.Min.y || world.y >= snapshot.discovery_bounds.Max.y) continue;
+            const auto options = footing_options.find({cx, cy});
+            if (options == footing_options.end()) continue;
+            for (const auto &option : options->second) {
+                if (option.pos.zplane != point.zplane || option.reveals.empty() || !Contains(option.trap, {point.x, point.y})) continue;
+                Candidate kept = option;
+                kept.pos = point;
+                kept.preserved = true;
+                candidates.push_back(std::move(kept));
+                break;
+            }
         }
         result.useful = static_cast<int>(candidates.size());
         result.unexplored = static_cast<int>(remaining.size());
@@ -992,9 +1406,9 @@ namespace {
                 }
             }
         }
-        const auto avoids_doors = [&](completion::Point a, completion::Point b) {
+        const auto avoids_doors = [&](completion::Point a, completion::Point b, const uint32_t plane) {
             return std::ranges::none_of(
-                path_doorways, [&](const Doorway &door) { return DistanceToSegmentSq(door.pos, {a.x, a.y}, {b.x, b.y}) < door.radius_sq; });
+                path_doorways, [&](const Doorway &door) { return DoorwayBlocks(door, {a.x, a.y}, {b.x, b.y}, plane); });
         };
         struct Search {
             std::vector<float> distance;
@@ -1012,7 +1426,7 @@ namespace {
             std::priority_queue<Entry, std::vector<Entry>, std::greater<>> open;
             for (const size_t id : incident[from]) {
                 check();
-                if (!avoids_doors({point.x, point.y}, nodes[id].point)) continue;
+                if (!avoids_doors({point.x, point.y}, nodes[id].point, static_cast<uint32_t>(planes.at(from)))) continue;
                 row->distance[id] = completion::Distance({point.x, point.y}, nodes[id].point);
                 open.emplace(row->distance[id], id);
             }
@@ -1025,7 +1439,7 @@ namespace {
                     check();
                     for (const size_t next : incident[trap]) {
                         check();
-                        if (!avoids_doors(nodes[id].point, nodes[next].point)) continue;
+                        if (!avoids_doors(nodes[id].point, nodes[next].point, static_cast<uint32_t>(planes.at(trap)))) continue;
                         const float value = travelled + completion::Distance(nodes[id].point, nodes[next].point);
                         if (value + .001f >= row->distance[next]) continue;
                         row->distance[next] = value;
@@ -1042,7 +1456,7 @@ namespace {
             std::pair<float, size_t> best{FLT_MAX, nodes.size()};
             for (const size_t id : incident[to]) {
                 check();
-                if (!avoids_doors(nodes[id].point, {point.x, point.y})) continue;
+                if (!avoids_doors(nodes[id].point, {point.x, point.y}, static_cast<uint32_t>(planes.at(to)))) continue;
                 const float value = row.distance[id] + completion::Distance(nodes[id].point, {point.x, point.y});
                 if (value < best.first) best = {value, id};
             }
@@ -1050,7 +1464,7 @@ namespace {
         };
         const auto connection_cost = [&](const Search &row, const GW::PathingTrapezoid *from, const GW::GamePos &a,
                                          const GW::PathingTrapezoid *to, const GW::GamePos &b) {
-            if (from == to && avoids_doors({a.x, a.y}, {b.x, b.y})) return hypotf(b.x - a.x, b.y - a.y);
+            if (from == to && avoids_doors({a.x, a.y}, {b.x, b.y}, static_cast<uint32_t>(planes.at(from)))) return hypotf(b.x - a.x, b.y - a.y);
             return destination(row, to, b).first;
         };
 
@@ -1073,6 +1487,11 @@ namespace {
         // Selection and visit order are deliberately separate: mixing distance into
         // set-cover caused the result.route to zig-zag between opposite sides of the map.
         std::vector<size_t> selected;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (!candidates[i].preserved || !std::ranges::any_of(candidates[i].reveals, [&](uint32_t fog) { return remaining.contains(fog); })) continue;
+            selected.push_back(i);
+            for (const auto fog : candidates[i].reveals) remaining.erase(fog);
+        }
         while (!remaining.empty() && selected.size() < 1024) {
             check();
             size_t best = candidates.size();
@@ -1162,6 +1581,28 @@ namespace {
         };
         rebuild_costs();
         auto order = completion::OptimizeOrder(costs, finish, two_opt_passes, restart_budget, static_cast<uint32_t>(map_id), check);
+        std::vector<size_t> kept_order;
+        for (size_t i = 0; i < selected.size(); ++i)
+            if (candidates[selected[i]].preserved) kept_order.push_back(i);
+        const bool preserve_existing_order = !kept_order.empty();
+        if (preserve_existing_order) {
+            for (const size_t target : order) {
+                if (candidates[selected[target]].preserved) continue;
+                size_t best = 0;
+                float best_extra = FLT_MAX;
+                for (size_t pos = 0; pos <= kept_order.size(); ++pos) {
+                    check();
+                    const size_t before = pos ? kept_order[pos - 1] : target_count;
+                    const bool has_after = pos < kept_order.size();
+                    const float extra = costs[before][target] +
+                        (has_after ? costs[target][kept_order[pos]] - costs[before][kept_order[pos]] : finish[target] -
+                            (before == target_count ? 0.f : finish[before]));
+                    if (extra < best_extra) { best_extra = extra; best = pos; }
+                }
+                kept_order.insert(kept_order.begin() + static_cast<ptrdiff_t>(best), target);
+            }
+            order = std::move(kept_order);
+        }
         const auto morph_options = candidates;
         for (int pass = 0; pass < relaxation_budget; ++pass) {
             check();
@@ -1170,6 +1611,7 @@ namespace {
                 check();
                 const size_t position = pass % 2 ? order.size() - 1 - step : step;
                 auto &current = candidates[selected[order[position]]];
+                if (current.preserved) continue;
                 for (const uint32_t fog : current.reveals)
                     --cover_count[fog];
                 std::vector<uint32_t> required;
@@ -1203,8 +1645,10 @@ namespace {
                 for (const auto &option : morph_options)
                     consider(option);
                 GW::Vec2f game_a, game_b;
-                if (world_to_game({best.cell_x * kWorldUnitsPerCell, best.cell_y * kWorldUnitsPerCell}, game_a, display_map) &&
-                    world_to_game({(best.cell_x + 1) * kWorldUnitsPerCell, (best.cell_y + 1) * kWorldUnitsPerCell}, game_b, display_map)) {
+                if (world_to_game({std::max(best.cell_x * kWorldUnitsPerCell, snapshot.discovery_bounds.Min.x),
+                                   std::max(best.cell_y * kWorldUnitsPerCell, snapshot.discovery_bounds.Min.y)}, game_a, display_map) &&
+                    world_to_game({std::min((best.cell_x + 1) * kWorldUnitsPerCell, snapshot.discovery_bounds.Max.x),
+                                   std::min((best.cell_y + 1) * kWorldUnitsPerCell, snapshot.discovery_bounds.Max.y)}, game_b, display_map)) {
                     const Candidate base = best;
                     const GW::Vec2f box_min{std::min(game_a.x, game_b.x), std::min(game_a.y, game_b.y)};
                     const GW::Vec2f box_max{std::max(game_a.x, game_b.x), std::max(game_a.y, game_b.y)};
@@ -1215,8 +1659,8 @@ namespace {
                                                  previous_point.y + t * (next_point.y - previous_point.y)};
                         GW::Vec2f footing;
                         float area;
-                        if (!TrapezoidCellOverlap(base.trap, box_min, box_max, footing, area, &preferred)) continue;
-                        if (IsBeyondKnownPortal(footing, path_min, path_max, static_cast<uint32_t>(snapshot.map))) continue;
+                        if (!TrapezoidCellOverlap(base.trap, box_min, box_max, footing, area, &preferred, snapshot.entry_margin)) continue;
+                        if (IsBeyondKnownPortal(footing, path_min, path_max, static_cast<uint32_t>(snapshot.map), &path_doorways)) continue;
                         Candidate option = base;
                         option.pos = {footing.x, footing.y, base.pos.zplane};
                         consider(option);
@@ -1228,7 +1672,7 @@ namespace {
             }
             if (!improved) break;
             rebuild_costs();
-            order = completion::OptimizeOrder(costs, finish, two_opt_passes, 0, 0, check);
+            if (!preserve_existing_order) order = completion::OptimizeOrder(costs, finish, two_opt_passes, 0, 0, check);
         }
 
         for (size_t position = order.size(); position-- > 0;) {
@@ -1246,7 +1690,7 @@ namespace {
         result.route.push_back(player->pos);
         const auto append_leg = [&](const GW::PathingTrapezoid *from, const GW::PathingTrapezoid *to, const GW::GamePos &goal) {
             std::vector<size_t> path;
-            if (from != to || !avoids_doors({result.route.back().x, result.route.back().y}, {goal.x, goal.y})) {
+            if (from != to || !avoids_doors({result.route.back().x, result.route.back().y}, {goal.x, goal.y}, static_cast<uint32_t>(planes.at(from)))) {
                 const auto row = search(from, result.route.back());
                 const auto [cost, last] = destination(*row, to, goal);
                 if (last == nodes.size() || cost == FLT_MAX) return false;
@@ -1299,7 +1743,7 @@ namespace {
                     }
                     const float t = (low + high) * .5f;
                     const float x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t;
-                    if (!avoids_doors({raw[i - 1].x, raw[i - 1].y}, {x, y}) || !avoids_doors({x, y}, {raw[i + 1].x, raw[i + 1].y}))
+                    if (!avoids_doors({raw[i - 1].x, raw[i - 1].y}, {x, y}, raw[i].zplane) || !avoids_doors({x, y}, {raw[i + 1].x, raw[i + 1].y}, raw[i].zplane))
                         continue;
                     movement += hypotf(x - raw[i].x, y - raw[i].y);
                     raw[i].x = x;
@@ -1317,7 +1761,7 @@ namespace {
                     ++furthest;
                 for (size_t candidate = furthest; candidate > at + 1; --candidate) {
                     check();
-                    if (avoids_doors({raw[at].x, raw[at].y}, {raw[candidate].x, raw[candidate].y}) &&
+                    if (avoids_doors({raw[at].x, raw[at].y}, {raw[candidate].x, raw[candidate].y}, raw[at].zplane) &&
                         completion::CrossesPortalsInOrder({raw[at].x, raw[at].y}, {raw[candidate].x, raw[candidate].y}, portals, at + 1,
                                                           candidate)) {
                         next = candidate;
@@ -1363,7 +1807,8 @@ namespace {
     {
         if (!build_future.valid() || build_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
         auto result = build_future.get();
-        if (!addon_enabled || terminating || build_cancel->load() || route_suspended || result.map != GW::Map::GetMapID() ||
+        if (!addon_enabled || terminating || build_cancel->load() || route_suspended ||
+            transition_event.load(std::memory_order_acquire) || !CompletionMapEligible() || result.map != GW::Map::GetMapID() ||
             result.instance != GW::Map::GetInstanceType())
             return;
         build_status = result.status;
@@ -1391,6 +1836,7 @@ namespace {
         route_map = result.map;
         route_instance = result.instance;
         route_progress = ground_progress = 0;
+        route_waypoint_visited.assign(route_waypoints.size(), false);
         route_waypoint_altitudes.clear();
         ground_route.clear();
         ground_route_indices.assign(1, 0);
@@ -1408,7 +1854,7 @@ namespace {
         PollBuild();
         if (!capture || !ContinueCapture()) return;
         auto snapshot = std::move(capture);
-        cartography_snapshot = snapshot->bits;
+        if (cartography_snapshot.size() != snapshot->bits.size()) cartography_snapshot = snapshot->bits;
         build_cancel = std::make_shared<std::atomic_bool>(false);
         build_status = "Optimizing route in background";
         build_future = std::async(std::launch::async, [snapshot = std::move(snapshot), cancelled = build_cancel]() mutable {
@@ -1654,8 +2100,15 @@ namespace {
         stop_symbol_vertices.reserve(route_waypoints.size() * 12);
         for (size_t i = 0; i < route_waypoints.size() && i < route_waypoint_narrow.size() && i < route_waypoint_altitudes.size(); i++) {
             if ((active_leg_only && route_waypoint_indices[i] != CurrentRouteEnd()) || !route_waypoint_narrow[i] ||
-                i >= route_waypoint_reveals.size() || std::ranges::all_of(route_waypoint_reveals[i], FogIndexExplored))
+                !WaypointNeedsVisit(i))
                 continue;
+            const size_t route_index = route_waypoint_indices[i];
+            if (route_index >= ground_route_indices.size()) continue;
+            const size_t ground_index = ground_route_indices[route_index];
+            if (ground_index <= first || ground_index > last) continue;
+            const bool active_stop = route_index == CurrentRouteEnd();
+            if (!active_stop && future_opacity == 0.f) continue;
+            const auto stop_alpha = static_cast<uint8_t>(245.f * (active_stop ? 1.f : future_opacity));
             const auto &ground = route_waypoints[i];
             const float altitude = route_waypoint_altitudes[i];
             const GW::Vec3f center{ground.x, ground.y, altitude - 145.f};
@@ -1667,7 +2120,7 @@ namespace {
             const auto vertex_at = [&](const float horizontal, const float vertical, const D3DCOLOR colour) {
                 return Vertex{center.x + rx * horizontal, center.y + ry * horizontal, center.z - vertical, colour};
             };
-            const Vertex middle{center.x, center.y, center.z, D3DCOLOR_ARGB(245, 205, 32, 32)};
+            const Vertex middle{center.x, center.y, center.z, D3DCOLOR_ARGB(stop_alpha, 205, 32, 32)};
             for (int edge = 0; edge < 8; edge++) {
                 const float a0 = DirectX::XM_2PI * static_cast<float>(edge) / 8.f + DirectX::XM_PI / 8.f;
                 const float a1 = DirectX::XM_2PI * static_cast<float>(edge + 1) / 8.f + DirectX::XM_PI / 8.f;
@@ -1675,7 +2128,7 @@ namespace {
                                                            vertex_at(cosf(a1) * radius, sinf(a1) * radius, middle.colour)});
             }
             const auto append_quad = [&](const float left, const float right, const float bottom, const float top) {
-                const D3DCOLOR white = D3DCOLOR_ARGB(255, 255, 250, 235);
+                const D3DCOLOR white = D3DCOLOR_ARGB(stop_alpha, 255, 250, 235);
                 const Vertex bl = vertex_at(left, bottom, white), br = vertex_at(right, bottom, white);
                 const Vertex tl = vertex_at(left, top, white), tr = vertex_at(right, top, white);
                 stop_symbol_vertices.insert(stop_symbol_vertices.end(), {tl, bl, tr, tr, bl, br});
@@ -1756,6 +2209,7 @@ void WorldCompletionPlugin::Initialize(ImGuiContext *ctx, const ImGuiAllocFns al
         // rendering immediately; Update performs the actual cleanup safely.
         route_suspended.store(true, std::memory_order_release);
         transition_event.store(true, std::memory_order_release);
+        if (build_cancel) build_cancel->store(true, std::memory_order_relaxed);
     };
     GW::UI::RegisterUIMessageCallback(&map_lifecycle_hook, GW::UI::UIMessage::kMapChange, on_map_lifecycle, -0x4000);
     GW::UI::RegisterUIMessageCallback(&map_lifecycle_hook, GW::UI::UIMessage::kMapLoaded, on_map_lifecycle, -0x4000);
@@ -1781,6 +2235,12 @@ void WorldCompletionPlugin::SignalTerminate()
 
 bool WorldCompletionPlugin::CanTerminate()
 {
+    PollVisitHistorySave();
+    if (visit_history_save.valid()) return false;
+    if (history_dirty && !history_save_failed) {
+        SaveVisitHistory();
+        if (visit_history_save.valid()) return false;
+    }
     if (build_future.valid()) {
         if (build_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return false;
         build_future.get();
@@ -1792,6 +2252,7 @@ void WorldCompletionPlugin::LoadSettings(const wchar_t *folder)
 {
     settings_folder_ = folder ? folder : L"";
     ToolboxUIPlugin::LoadSettings(folder);
+    if (folder) LoadVisitHistory(std::filesystem::path(folder));
     debug_log.close();
     last_log_summary.clear();
     const std::filesystem::path log_path = std::filesystem::path(folder) / L"WorldCompletion.log";
@@ -1821,6 +2282,8 @@ void WorldCompletionPlugin::LoadSettings(const wchar_t *folder)
     LoadSetting("ground_horizon", ground_horizon);
     LoadSetting("optimization_quality", optimization_quality);
     LoadSetting("relaxation_passes", relaxation_passes);
+    LoadSetting("waypoint_entry_margin", waypoint_entry_margin);
+    LoadSetting("include_outside_squares", include_outside_squares);
     LoadSetting("randomized_restarts", randomized_restarts);
     LoadSetting("end_portal_index", end_portal_index);
     LoadSetting("end_portal_map", end_portal_map);
@@ -1832,6 +2295,7 @@ void WorldCompletionPlugin::LoadSettings(const wchar_t *folder)
     arrow_size_percent = std::clamp(arrow_size_percent, 10, 250);
     optimization_quality = std::clamp(optimization_quality, 0, 2);
     relaxation_passes = std::clamp(relaxation_passes, 0, 8);
+    waypoint_entry_margin = std::clamp(waypoint_entry_margin, 64.f, 512.f);
     randomized_restarts = std::clamp(randomized_restarts, 0, 12);
 }
 
@@ -1858,10 +2322,13 @@ void WorldCompletionPlugin::SaveSettings(const wchar_t *folder)
     SaveSetting("ground_horizon", ground_horizon);
     SaveSetting("optimization_quality", optimization_quality);
     SaveSetting("relaxation_passes", relaxation_passes);
+    SaveSetting("waypoint_entry_margin", waypoint_entry_margin);
+    SaveSetting("include_outside_squares", include_outside_squares);
     SaveSetting("randomized_restarts", randomized_restarts);
     SaveSetting("end_portal_index", end_portal_index);
     SaveSetting("end_portal_map", end_portal_map);
     ToolboxUIPlugin::SaveSettings(folder);
+    SaveVisitHistory();
 }
 
 bool WorldCompletionPlugin::IsLoadedContext() const
@@ -1878,19 +2345,35 @@ bool WorldCompletionPlugin::IsPogahnMissionAdaptationActive() const
 void WorldCompletionPlugin::Update(const float)
 {
     const uint32_t now = GetTickCount();
-    if (transition_event.exchange(false, std::memory_order_acq_rel)) SuspendRoute(now);
+    PollVisitHistorySave();
+    if (history_dirty && now - last_history_save >= 2000) SaveVisitHistory();
+    if (transition_event.exchange(false, std::memory_order_acq_rel)) {
+        SaveVisitHistory();
+        SuspendRoute(now);
+    }
     if (!addon_enabled || terminating) {
         PollBuild();
         return;
     }
     current_instance_ = GW::Map::GetInstanceType();
     current_map_ = GW::Map::GetMapID();
-    if (!GW::Map::GetIsMapLoaded() || current_instance_ != GW::Constants::InstanceType::Explorable) {
+    if (!CompletionMapEligible()) {
+        birds_eye_compass = false;
+        birds_eye_effect_id = 0;
         if (!route_suspended || BuildBusy()) SuspendRoute(now);
+        build_status = "Inactive: this area does not count toward world completion";
         PollBuild();
         return;
     }
     if (!route_suspended && (current_map_ != route_map || current_instance_ != route_instance)) SuspendRoute(now);
+    birds_eye_effect_id = BirdsEyeViewEffect();
+    UpdateVisitContext();
+    const bool compass_active = birds_eye_effect_id != 0;
+    if (compass_active != birds_eye_compass) {
+        birds_eye_compass = compass_active;
+        recompute_requested.store(true, std::memory_order_release);
+        if (BuildBusy()) CancelBuild();
+    }
     PollBuild();
     if (route_suspended) {
         if (pending_map != current_map_ || pending_instance != current_instance_) {
@@ -1910,7 +2393,9 @@ void WorldCompletionPlugin::Update(const float)
         last_rebuild = now;
         return;
     }
+    CheckNavigationChanges(now);
     AdvanceBuild();
+    ScanDiscoveredHistory();
     UpdateGroundRoute();
     if (!ground_building && route_waypoint_altitudes.size() < route_waypoints.size()) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
@@ -1930,9 +2415,8 @@ void WorldCompletionPlugin::Update(const float)
                     uint32_t newly_explored = current[word] & ~cartography_snapshot[word];
                     while (newly_explored) {
                         const uint32_t fog = static_cast<uint32_t>(word * 32 + std::countr_zero(newly_explored));
-                        const bool planned = std::ranges::any_of(
-                            route_waypoint_reveals, [&](const auto &reveals) { return std::ranges::find(reveals, fog) != reveals.end(); });
-                        if (!planned) recompute_requested.store(true);
+                        if (history_width && fog / history_width < world->h05B4[1]) RememberDiscovered(fog);
+                        // Fog discovery retires existing visits without rebuilding the route.
                         newly_explored &= newly_explored - 1;
                     }
                 }
@@ -1940,10 +2424,34 @@ void WorldCompletionPlugin::Update(const float)
             cartography_snapshot.assign(current, current + words);
         }
     }
-    if (const auto *player = GW::Agents::GetControlledCharacter(); player && route.size() > 1) {
+    const auto *player = GW::Agents::GetControlledCharacter();
+    if (player && route.size() > 1) {
         route_progress = ClosestRoutePointThrough(player->pos, CurrentRouteEnd());
         if (!ground_building && ground_route.size() > 1) ground_progress = ClosestGroundPoint({player->pos.x, player->pos.y, player->z});
+        {
+            const auto found = std::ranges::find(route_waypoint_indices, CurrentRouteEnd());
+            const size_t stop = static_cast<size_t>(found - route_waypoint_indices.begin());
+            const auto *world = GW::GetWorldContext();
+            GW::Vec2f player_world, stop_world;
+            const bool valid = stop < route_waypoints.size() && stop < route_waypoint_reveals.size() && fog_grid_width &&
+                               world && world->cartographed_areas.valid() &&
+                               GameToWorld(player->pos, player_world, CartographyMapID()) &&
+                               GameToWorld(route_waypoints[stop], stop_world, CartographyMapID());
+            const bool at_stop = valid && WaypointNeedsVisit(stop) && player->pos.zplane == route_waypoints[stop].zplane &&
+                                 FogCellX(player_world.x) == FogCellX(stop_world.x) && FogCellY(player_world.y) == FogCellY(stop_world.y);
+            if (at_stop) {
+                route_waypoint_visited[stop] = true;
+                pending_discovery.push_back({route_waypoint_reveals[stop], now});
+                if (BuildBusy()) {
+                    CancelBuild();
+                    recompute_requested.store(true, std::memory_order_release);
+                }
+            }
+        }
     }
+    const auto *discovery_world = GW::GetWorldContext();
+    if (!BuildBusy() && discovery_world && discovery_world->cartographed_areas.valid() && ReviewDiscovery(now))
+        recompute_requested.store(true, std::memory_order_release);
     if (recompute_requested.load() && BuildBusy()) CancelBuild();
     const bool retry = route.empty() && build_status != "nothing_reachable_to_discover" && now - last_rebuild >= 3000;
     if (!BuildBusy() && now - last_rebuild >= 500 && (recompute_requested.load() || retry)) {
@@ -1958,6 +2466,21 @@ void WorldCompletionPlugin::DrawSettings()
     bool enabled = addon_enabled;
     if (ImGui::Checkbox("Enable World Completion", &enabled)) SetEnabled(enabled);
     ImGui::Text("%s", build_status.c_str());
+    if (const auto *record = CurrentVisits()) {
+        ImGui::Text("Confirmed discoveries on this character/map: %u", static_cast<unsigned>(record->discovered.size()));
+        ImGui::Text("Visit history: %s", history_status.c_str());
+    }
+    ImGui::Text("Skipped squares this map visit: %u", static_cast<unsigned>(skipped_fog.size()));
+    ImGui::Text("Visits awaiting discovery confirmation: %u", static_cast<unsigned>(pending_discovery.size()));
+    if (!skipped_fog.empty() && ImGui::Button("Retry skipped squares")) {
+        skipped_fog.clear();
+        if (auto *record = CurrentVisits()) {
+            record->skipped.clear();
+            history_dirty = true;
+        }
+        pending_discovery.clear();
+        recompute_requested.store(true, std::memory_order_release);
+    }
     ImGui::TextWrapped("The bright route is your current leg. Faded lines are later visits, including shared roads.");
     ImGui::Separator();
     ImGui::Checkbox("Show debug status", &show_debug_status_);
@@ -1988,6 +2511,13 @@ void WorldCompletionPlugin::DrawSettings()
     }
     const char *quality_names[] = {"Fast", "Balanced", "Thorough"};
     bool optimization_changed = ImGui::Combo("Optimization quality", &optimization_quality, quality_names, IM_ARRAYSIZE(quality_names));
+    optimization_changed |= ImGui::Checkbox("Include adjacent squares outside the zone", &include_outside_squares);
+    ImGui::TextWrapped("Off: complete only the zone rectangle. On: also target outside squares from normal adjacent range, even with Bird\'s Eye View.");
+    ImGui::Text("Bird's Eye View: %s", birds_eye_compass ? "active (+2 reveal squares)" : "inactive");
+    if (birds_eye_effect_id) ImGui::Text("Detected effect skill ID: %u", birds_eye_effect_id);
+    ImGui::TextWrapped("The buff is detected automatically. The route rebuilds when it appears or expires.");
+    optimization_changed |= ImGui::SliderFloat("Waypoint entry margin", &waypoint_entry_margin, 64.f, 512.f, "%.0f game units");
+    ImGui::TextWrapped("Stops stay visible until discovery is confirmed. Larger margins enter squares deeper; tiny overlaps use a smaller margin.");
     optimization_changed |= ImGui::SliderInt("Relaxation passes", &relaxation_passes, 0, 8);
     optimization_changed |= ImGui::SliderInt("Randomized restarts", &randomized_restarts, 0, 12);
     if (optimization_changed) recompute_requested.store(true, std::memory_order_release);
@@ -1996,7 +2526,7 @@ void WorldCompletionPlugin::DrawSettings()
 
 void WorldCompletionPlugin::Draw(IDirect3DDevice9 *device)
 {
-    if (terminating || !IsLoadedContext() || GW::Map::GetInstanceType() != GW::Constants::InstanceType::Explorable) return;
+    if (terminating || transition_event.load(std::memory_order_acquire) || !CompletionMapEligible()) return;
 
     const float arrow_scale = static_cast<float>(arrow_size_percent) / 100.f;
     ImRect mission_clip;
@@ -2101,7 +2631,7 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9 *device)
 
     if (!addon_enabled || route_suspended || route_map != GW::Map::GetMapID() || route_instance != GW::Map::GetInstanceType()) return;
 
-    if (show_ground_route_ && current_instance_ == GW::Constants::InstanceType::Explorable) {
+    if (show_ground_route_) {
         if (!occlude_ground_route_ || !DrawOccludedGroundRoute(device, route_thickness_, arrow_scale)) DrawGroundRoute(arrow_scale);
     }
 
@@ -2164,7 +2694,7 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9 *device)
                 }
                 const ImU32 colour = route_colour;
                 for (size_t i = 0; i < route_waypoints.size(); i++) {
-                    if (i < route_waypoint_reveals.size() && std::ranges::all_of(route_waypoint_reveals[i], FogIndexExplored)) continue;
+                    if (!WaypointNeedsVisit(i)) continue;
                     GW::Vec2f wm;
                     ImVec2 screen;
                     if (!GameToWorld(route_waypoints[i], wm, display_map)) continue;
@@ -2172,7 +2702,7 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9 *device)
                         GW::UI::GetIsWorldMapShowing() ? ProjectWorldMap(wm, screen, clip) : ProjectMissionMap(wm, screen, clip);
                     if (!projected) continue;
                     const bool active_stop = route_waypoint_indices[i] == active_end;
-                    if (active_leg_only && !active_stop) continue;
+                    if (!active_stop && (active_leg_only || future_opacity == 0.f)) continue;
                     const ImU32 stop_colour = active_stop ? active_colour : future_colour;
                     bool narrow_stop = i < route_waypoint_narrow.size() && route_waypoint_narrow[i];
                     if (narrow_stop && i < route_waypoint_reveals.size()) {
@@ -2187,9 +2717,10 @@ void WorldCompletionPlugin::Draw(IDirect3DDevice9 *device)
                         }
                     }
                     if (narrow_stop) {
-                        dl->AddNgonFilled(screen, 8.f, IM_COL32(210, 35, 35, 245), 8);
-                        dl->AddNgon(screen, 8.f, IM_COL32(255, 245, 225, 255), 8, 2.f);
-                        dl->AddText({screen.x - 2.f, screen.y - 7.f}, IM_COL32_WHITE, "!");
+                        const int alpha = static_cast<int>(245.f * (active_stop ? 1.f : future_opacity));
+                        dl->AddNgonFilled(screen, 8.f, IM_COL32(210, 35, 35, alpha), 8);
+                        dl->AddNgon(screen, 8.f, IM_COL32(255, 245, 225, alpha), 8, 2.f);
+                        dl->AddText({screen.x - 2.f, screen.y - 7.f}, IM_COL32(255, 255, 255, alpha), "!");
                     }
                     else {
                         dl->AddCircleFilled(screen, waypoint_size + outline_width, outline_colour);

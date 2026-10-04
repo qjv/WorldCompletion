@@ -12,6 +12,20 @@ This project is vibecoded.
 
 The current leg is highlighted; later legs are faded. The route also appears on the ground. Colors, thickness, outlines, arrows, waypoint size, and the amount of ground route shown are adjustable in the plugin settings.
 
+Bird's Eye View is detected automatically from your active effects, including alternate skill IDs with the same buff-name ID. While active, the planner uses a three-square reveal radius instead of one. The route rebuilds when the buff appears or expires; plugin settings show its status and detected skill ID.
+
+Routing runs in eligible outposts as well as explorable areas. Areas off the world map, dungeons, guild halls, pre-Searing, the Realm of Torment, and rectangles without cartography-credit squares automatically suspend routing. Returning to an eligible area resumes it. Navigation is checked once per second for additional walkable geometry or opening connections. Stable state, buffer replacements and path closures alone do not trigger a rebuild. New terrain triggers a background extension and retries skipped targets while preserving confirmed discoveries. Useful existing waypoint positions and their relative order are retained; new stops are inserted around them. Completed, unreachable or redundant stops are removed. Map changes cancel pending work; mesh capture checks map identity and source buffers before reading them.
+
+Portal blocking traces the narrowest continuous walkable passage through the portal, joining its two mesh walls with a thin barrier. Nearby travel on the same side stays available; routing and smoothing cannot cross the barrier. Tracing runs in the background and respects the portal floor. A conservative fallback remains where a reliable pair of walls cannot be found.
+
+Discovery stops stay inside the current area's map boundaries. By default, routes focus only on the zone rectangle. Enable **Include adjacent squares outside the zone** to target its outer border too. Outside squares are targeted only from directly adjacent cells at normal reveal range; Bird's Eye View's extra range is restricted to in-zone targets.
+
+Stops enter reveal cells slightly deeper to allow discovery to register. Adjust **Waypoint entry margin** to change the depth. Entering a stop's reveal cell advances the route while the plugin checks discovery in the background; you do not need to pause at each marker.
+
+Discovery confirmation gets 2.5 seconds after entering the cell, even if you keep moving. Squares that remain unrevealed are given any remaining planned visits before being skipped. Pending visits are shown in settings and are not treated as explored. This affects WorldCompletion's route; Toolbox's own green Cartographer overlay is separate.
+
+Confirmed discoveries and skipped targets are remembered separately for each character and map in `WorldCompletion.visits`, alongside the plugin settings. On entering a zone, the plugin scans its uncovered squares and the adjacent border; new outside-zone discoveries observed while there are saved too. Walking through a square or timing out never marks it discovered. Returning to a zone avoids targeting its remembered discoveries, while roads through explored areas remain available for travel. The file uses whichever is smaller: delta-encoded square IDs or runs of consecutive IDs, packed into variable-length integers. Scans are spread across frames and writes run in the background. **Retry skipped squares** clears only failed targets, keeping confirmed discoveries.
+
 Click a numbered portal marker on the mission map to finish the route there. The planner recalculates the visit order with that portal as the endpoint. Click the selected portal again to clear it.
 
 The map toggle disables planning and the overlays. The refresh button rebuilds the route from your current position.
