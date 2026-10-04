@@ -62,7 +62,50 @@ static void Validate(const BuildSnapshot& snapshot, const BuildResult& result)
 
 int main()
 {
+    for (const float offset : {0.f, 20000.f, -20000.f}) {
+        const auto plane = Plane({{offset - 1.f, offset - 1.f, offset + .25f, offset + .25f}}, 1);
+        GW::Vec2f footing{};
+        float area = 0.f;
+        assert(TrapezoidCellOverlap(&plane.trapezoids[0], {offset, offset},
+                                   {offset + 3072.f, offset + 3072.f}, footing, area));
+        assert(std::abs(area - .0625f) < 1e-6f);
+        assert(footing.x == offset + .125f && footing.y == offset + .125f);
+        assert(Contains(&plane.trapezoids[0], footing));
+        const GW::Vec2f approach{offset - 10.f, offset + .125f};
+        assert(TrapezoidCellOverlap(&plane.trapezoids[0], {offset, offset},
+                                   {offset + 3072.f, offset + 3072.f}, footing, area, &approach));
+        assert(footing.x > offset && footing.x < offset + .125f);
+        assert(Contains(&plane.trapezoids[0], footing));
+    }
+    {
+        const auto plane = Plane({{0, 0, 3072, 3072}}, 1);
+        const GW::Vec2f approach{-1000, 1536};
+        GW::Vec2f footing{};
+        float area = 0.f;
+        assert(TrapezoidCellOverlap(&plane.trapezoids[0], {0, 0}, {3072, 3072}, footing, area, &approach));
+        assert(footing.x == 32.f && footing.y == 1536.f);
+    }
     std::atomic_bool cancel{false};
+    {
+        auto snapshot = Snapshot();
+        snapshot.maps.push_back(Plane({{0, 0, 6144, 3072}}, 50));
+        Fog(snapshot, 2, 7);
+        snapshot.relaxation = 0;
+        BuildResult centered;
+        BuildRoute(snapshot, centered, cancel);
+        snapshot.relaxation = 8;
+        BuildResult edge;
+        BuildRoute(snapshot, edge, cancel);
+        Validate(snapshot, centered);
+        Validate(snapshot, edge);
+        assert(centered.waypoints.size() == 1 && edge.waypoints.size() == 1);
+        assert(centered.reveals == edge.reveals);
+        const auto distance = [&](const GW::GamePos &point) {
+            return hypotf(point.x - snapshot.player.x, point.y - snapshot.player.y);
+        };
+        assert(distance(edge.waypoints[0]) + 1000.f < distance(centered.waypoints[0]));
+        assert(edge.waypoints[0].x > 3072.f && edge.waypoints[0].x < 3104.f);
+    }
     {
         auto snapshot = Snapshot();
         snapshot.maps.push_back(Plane({{0, 0, 3072, 3072}, {3072, 0, 6144, 3072}, {6144, 0, 9216, 3072}}, 100));

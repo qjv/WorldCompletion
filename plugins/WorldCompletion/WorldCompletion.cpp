@@ -334,7 +334,7 @@ namespace {
     }
 
     bool TrapezoidCellOverlap(const GW::PathingTrapezoid *trap, const GW::Vec2f &box_min, const GW::Vec2f &box_max, GW::Vec2f &footing,
-                              float &overlap_area)
+                              float &overlap_area, const GW::Vec2f *preferred = nullptr)
     {
         if (!trap || std::min(trap->XTL, trap->XBL) > box_max.x || std::max(trap->XTR, trap->XBR) < box_min.x || trap->YB > box_max.y ||
             trap->YT < box_min.y)
@@ -346,19 +346,51 @@ namespace {
         count = ClipHalfPlane(poly, count, 1, box_min.y, true);
         count = ClipHalfPlane(poly, count, 1, box_max.y, false);
         if (count < 3) return false;
-        float area2 = 0.f;
-        GW::Vec2f centroid{};
+        // Local coordinates avoid cancellation for small overlaps far from the map origin.
+        const auto origin = poly[0];
+        double area2 = 0., centroid_x = 0., centroid_y = 0.;
         for (size_t i = 0; i < count; i++) {
             const auto &a = poly[i];
             const auto &b = poly[(i + 1) % count];
-            const float cross = a.x * b.y - b.x * a.y;
+            const double ax = static_cast<double>(a.x) - origin.x;
+            const double ay = static_cast<double>(a.y) - origin.y;
+            const double bx = static_cast<double>(b.x) - origin.x;
+            const double by = static_cast<double>(b.y) - origin.y;
+            const double cross = ax * by - bx * ay;
             area2 += cross;
-            centroid.x += (a.x + b.x) * cross;
-            centroid.y += (a.y + b.y) * cross;
+            centroid_x += (ax + bx) * cross;
+            centroid_y += (ay + by) * cross;
         }
-        if (fabsf(area2) < 1e-3f) return false;
-        footing = {centroid.x / (3.f * area2), centroid.y / (3.f * area2)};
-        overlap_area = fabsf(area2) * 0.5f;
+        if (std::abs(area2) < 1e-3) return false;
+        footing = {static_cast<float>(origin.x + centroid_x / (3. * area2)),
+                   static_cast<float>(origin.y + centroid_y / (3. * area2))};
+        overlap_area = static_cast<float>(std::abs(area2) * 0.5);
+        if (preferred) {
+            GW::Vec2f closest = footing;
+            float distance_sq = FLT_MAX;
+            if (Contains(trap, *preferred) && preferred->x >= box_min.x && preferred->x <= box_max.x &&
+                preferred->y >= box_min.y && preferred->y <= box_max.y) {
+                closest = *preferred;
+            }
+            else {
+                for (size_t i = 0; i < count; ++i) {
+                    const auto a = poly[i], b = poly[(i + 1) % count];
+                    const float dx = b.x - a.x, dy = b.y - a.y;
+                    const float length_sq = dx * dx + dy * dy;
+                    const float t = length_sq > 0.f ? std::clamp(((preferred->x - a.x) * dx + (preferred->y - a.y) * dy) / length_sq, 0.f, 1.f) : 0.f;
+                    const GW::Vec2f point{a.x + t * dx, a.y + t * dy};
+                    const float distance = (point.x - preferred->x) * (point.x - preferred->x) +
+                                           (point.y - preferred->y) * (point.y - preferred->y);
+                    if (distance >= distance_sq) continue;
+                    distance_sq = distance;
+                    closest = point;
+                }
+            }
+            // Stay slightly inside the reveal cell; scale the margin down for tiny slivers.
+            const float distance = hypotf(footing.x - closest.x, footing.y - closest.y);
+            const float inset = distance > 0.f ? std::min(32.f / distance, .25f) : 0.f;
+            footing = {closest.x + inset * (footing.x - closest.x), closest.y + inset * (footing.y - closest.y)};
+        }
         return true;
     }
 
@@ -1170,6 +1202,26 @@ namespace {
                         consider(option);
                 for (const auto &option : morph_options)
                     consider(option);
+                GW::Vec2f game_a, game_b;
+                if (world_to_game({best.cell_x * kWorldUnitsPerCell, best.cell_y * kWorldUnitsPerCell}, game_a, display_map) &&
+                    world_to_game({(best.cell_x + 1) * kWorldUnitsPerCell, (best.cell_y + 1) * kWorldUnitsPerCell}, game_b, display_map)) {
+                    const Candidate base = best;
+                    const GW::Vec2f box_min{std::min(game_a.x, game_b.x), std::min(game_a.y, game_b.y)};
+                    const GW::Vec2f box_max{std::max(game_a.x, game_b.x), std::max(game_a.y, game_b.y)};
+                    for (int sample = 0; sample <= (next_trap ? 8 : 0); ++sample) {
+                        check();
+                        const float t = static_cast<float>(sample) / 8.f;
+                        const GW::Vec2f preferred{previous_point.x + t * (next_point.x - previous_point.x),
+                                                 previous_point.y + t * (next_point.y - previous_point.y)};
+                        GW::Vec2f footing;
+                        float area;
+                        if (!TrapezoidCellOverlap(base.trap, box_min, box_max, footing, area, &preferred)) continue;
+                        if (IsBeyondKnownPortal(footing, path_min, path_max, static_cast<uint32_t>(snapshot.map))) continue;
+                        Candidate option = base;
+                        option.pos = {footing.x, footing.y, base.pos.zplane};
+                        consider(option);
+                    }
+                }
                 current = std::move(best);
                 for (const uint32_t fog : current.reveals)
                     ++cover_count[fog];
