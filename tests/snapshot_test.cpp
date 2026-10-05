@@ -84,6 +84,16 @@ int main()
 
     {
         assert(CompletionMapEligible()); // Cartography outpost.
+        const auto normal_map = GW::Map::id;
+        for (const auto map : {GW::Constants::MapID::The_Dragons_Lair, GW::Constants::MapID::Sorrows_Furnace, GW::Constants::MapID::The_Undercity, GW::Constants::MapID::Dragons_Throat, GW::Constants::MapID::Dragons_Throat_area__What_Waits_in_Shadow, GW::Constants::MapID::The_Deep, GW::Constants::MapID::Urgozs_Warren, GW::Constants::MapID::Secure_the_Refuge, GW::Constants::MapID::Secure_the_Refuge_cinematic, GW::Constants::MapID::Sunspear_Sanctuary_outpost, GW::Constants::MapID::Command_Post, GW::Constants::MapID::Moddok_Crevice, GW::Constants::MapID::Bahdok_Caverns, GW::Constants::MapID::Dasha_Vestibule, GW::Constants::MapID::The_Hidden_City_of_Ahdashim, GW::Constants::MapID::Hidden_City_of_Ahdashim_cinematic}) {
+            GW::Map::id = static_cast<uint32_t>(map);
+            assert(!CompletionMapEligible()); // Green overlapping bounds must not admit interiors.
+            GW::Map::instance = GW::Constants::InstanceType::Explorable;
+            assert(!CompletionMapEligible());
+            GW::Map::instance = GW::Constants::InstanceType::Outpost;
+        }
+        GW::Map::id = normal_map;
+        assert(CompletionMapEligible());
         GW::Map::instance = GW::Constants::InstanceType::Explorable;
         assert(CompletionMapEligible());
         GW::Map::loaded = false;
@@ -105,6 +115,8 @@ int main()
         assert(!CompletionMapEligible());
         GW::Map::info.guild_hall = false;
         GW::Map::info.region = GW::Region_Presearing;
+        assert(!CompletionMapEligible());
+        GW::Map::info.region = GW::Region_DepthsOfTyria;
         assert(!CompletionMapEligible());
         GW::Map::info.region = GW::Region_Kryta;
         ++GW::Map::id;
@@ -262,6 +274,42 @@ int main()
         for (const auto& reveal : open.reveals)
             covers_far_side |= std::ranges::find(reveal, 6 * 32 + 4) != reveal.end();
         assert(covers_far_side);
+    }
+    {
+        auto snapshot = Snapshot();
+        snapshot.maps.push_back(Plane({{0, 0, 25000, 25000}}, 900));
+        snapshot.player = {10752, 13824, 0}; // Three cells inward from the left-edge fog.
+        snapshot.relaxation = 0;
+        Fog(snapshot, 0, 3);
+        std::atomic_bool cancelled{false};
+        BuildResult normal;
+        BuildRoute(snapshot, normal, cancelled);
+        Validate(snapshot, normal);
+        assert(normal.waypoints.size() == 1);
+        assert(normal.waypoints[0].x > 3072); // Use the normal adjacent cell.
+        snapshot.previous_waypoints = normal.waypoints;
+        snapshot.previous_reveal_radius = 1;
+        snapshot.reveal_radius = 3;
+        BuildResult birds_eye;
+        BuildRoute(snapshot, birds_eye, cancelled);
+        Validate(snapshot, birds_eye);
+        assert(birds_eye.waypoints.size() == 1);
+        assert(birds_eye.waypoints[0].x == snapshot.player.x);
+        assert(birds_eye.waypoints[0].y == snapshot.player.y);
+        assert(birds_eye.reveals[0] == std::vector<uint32_t>{3 * 32});
+        assert(birds_eye.length + 5000 < normal.length);
+        snapshot.previous_waypoints = birds_eye.waypoints;
+        snapshot.previous_reveal_radius = 3;
+        BuildResult stable;
+        BuildRoute(snapshot, stable, cancelled);
+        assert(stable.waypoints.size() == 1);
+        assert(stable.waypoints[0].x == birds_eye.waypoints[0].x);
+        assert(stable.waypoints[0].y == birds_eye.waypoints[0].y);
+        snapshot.reveal_radius = 1;
+        BuildResult expired;
+        BuildRoute(snapshot, expired, cancelled);
+        Validate(snapshot, expired);
+        assert(expired.waypoints[0].x < 6144);
     }
     for (const float offset : {0.f, 20000.f, -20000.f}) {
         const auto plane = Plane({{offset - 1.f, offset - 1.f, offset + .25f, offset + .25f}}, 1);

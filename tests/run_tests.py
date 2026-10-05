@@ -46,7 +46,7 @@ namespace GW {
     struct GamePos { float x = 0, y = 0; uint32_t zplane = 0; };
     struct PathingTrapezoid { float XTL, XTR, YT, XBL, XBR, YB; };
     namespace Constants {
-        enum class MapID { None };
+        enum class MapID { None, The_Dragons_Lair, Sorrows_Furnace, The_Undercity, Dragons_Throat, Dragons_Throat_area__What_Waits_in_Shadow, The_Deep, Urgozs_Warren, Secure_the_Refuge, Secure_the_Refuge_cinematic, Sunspear_Sanctuary_outpost, Command_Post, Moddok_Crevice, Bahdok_Caverns, Dasha_Vestibule, The_Hidden_City_of_Ahdashim, Hidden_City_of_Ahdashim_cinematic };
         enum class InstanceType { Loading, Explorable, Outpost };
         enum class SkillID : uint32_t {};
     }
@@ -71,7 +71,7 @@ namespace GW {
 struct ImRect { GW::Vec2f Min, Max; };
 namespace GW {
     enum class RegionType { Outpost, Dungeon };
-    enum Region { Region_Kryta, Region_Presearing };
+    enum Region { Region_Kryta, Region_Presearing, Region_DepthsOfTyria };
     enum class Continent { Tyria, RealmOfTorment };
     struct AreaInfo {
         RegionType type = RegionType::Outpost;
@@ -84,7 +84,7 @@ namespace GW {
     namespace Map {
         bool loaded = true;
         Constants::InstanceType instance = Constants::InstanceType::Outpost;
-        uint32_t id = 1;
+        uint32_t id = 1000;
         AreaInfo info;
         bool GetIsMapLoaded() { return loaded; }
         Constants::InstanceType GetInstanceType() { return instance; }
@@ -117,7 +117,7 @@ completion::MapVisits* CurrentVisits() { return fixture_visits; }
 markers = [
     "struct DiscoveryVisit {", "void RememberDiscovered(", "bool WaypointNeedsVisit(", "size_t CurrentRouteEnd(", "bool ReviewDiscovery(",
     "uint32_t BirdsEyeViewEffect(",
-    "int FogCellX(", "int FogCellY(", "bool FogCellWithinBounds(", "bool DiscoveryCellAllowed(", "bool MaskContains(", "bool CompletionMapEligible(", "struct Candidate {",
+    "int FogCellX(", "int FogCellY(", "bool FogCellWithinBounds(", "bool DiscoveryCellAllowed(", "bool MaskContains(", "bool NonCompletionInterior(", "bool CompletionMapEligible(", "struct Candidate {",
     "bool Contains(", "GW::Vec2f ClosestPoint(", "GW::GamePos Centre(",
     "std::optional<completion::Portal> SharedPortal(", "size_t ClipHalfPlane(",
     "bool TrapezoidCellOverlap(", "struct Doorway {", "float DistanceToSegmentSq(",

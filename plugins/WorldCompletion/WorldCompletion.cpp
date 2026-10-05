@@ -92,6 +92,7 @@ namespace {
         const GW::PathingTrapezoid *trap = nullptr;
         std::vector<uint32_t> reveals;
         float footing_area = 0.f;
+        float approach_cost = FLT_MAX;
         bool preserved = false;
         int cell_x = 0;
         int cell_y = 0;
@@ -108,6 +109,7 @@ namespace {
     std::vector<float> route_waypoint_altitudes;
     std::vector<GW::Vec3f> ground_route;
     uint32_t fog_grid_width = 0;
+    int route_reveal_radius = 1;
     GW::Constants::MapID route_map = GW::Constants::MapID::None;
     GW::Constants::InstanceType route_instance = GW::Constants::InstanceType::Loading;
     GW::Constants::MapID pending_map = GW::Constants::MapID::None;
@@ -307,6 +309,7 @@ namespace {
         ground_core_vertices.clear();
         cartography_snapshot.clear();
         route_connected = false;
+        route_reveal_radius = 1;
         route_map = GW::Constants::MapID::None;
         route_instance = GW::Constants::InstanceType::Loading;
         ground_vertices_dirty = true;
@@ -390,15 +393,44 @@ namespace {
         return cached_display;
     }
 
+    bool NonCompletionInterior(const GW::Constants::MapID map)
+    {
+        // https://wiki.guildwars.com/wiki/Guide_to_Legendary_Cartographer
+        // World-map rectangles alone cannot identify underground interiors.
+        switch (map) {
+        case GW::Constants::MapID::The_Dragons_Lair:
+        case GW::Constants::MapID::Sorrows_Furnace:
+        case GW::Constants::MapID::The_Undercity:
+        case GW::Constants::MapID::Dragons_Throat:
+        case GW::Constants::MapID::Dragons_Throat_area__What_Waits_in_Shadow:
+        case GW::Constants::MapID::The_Deep:
+        case GW::Constants::MapID::Urgozs_Warren:
+        case GW::Constants::MapID::Secure_the_Refuge:
+        case GW::Constants::MapID::Secure_the_Refuge_cinematic:
+        case GW::Constants::MapID::Sunspear_Sanctuary_outpost:
+        case GW::Constants::MapID::Command_Post:
+        case GW::Constants::MapID::Moddok_Crevice:
+        case GW::Constants::MapID::Bahdok_Caverns:
+        case GW::Constants::MapID::Dasha_Vestibule:
+        case GW::Constants::MapID::The_Hidden_City_of_Ahdashim:
+        case GW::Constants::MapID::Hidden_City_of_Ahdashim_cinematic:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     bool CompletionMapEligible()
     {
         const auto instance = GW::Map::GetInstanceType();
         if (!GW::Map::GetIsMapLoaded() ||
             (instance != GW::Constants::InstanceType::Explorable && instance != GW::Constants::InstanceType::Outpost)) return false;
+        if (NonCompletionInterior(GW::Map::GetMapID()) || NonCompletionInterior(CartographyMapID())) return false;
         const auto *actual = GW::Map::GetMapInfo(GW::Map::GetMapID());
         const auto *display = GW::Map::GetMapInfo(CartographyMapID());
         if (!actual || !display || !actual->GetIsOnWorldMap() || actual->GetIsGuildHall() ||
             actual->type == GW::RegionType::Dungeon || actual->region == GW::Region_Presearing ||
+            actual->region == GW::Region_DepthsOfTyria ||
             actual->continent == GW::Continent::RealmOfTorment) return false;
         const auto *mask = CreditableMask(display);
         ImRect bounds;
@@ -902,7 +934,7 @@ namespace {
         GW::Constants::InstanceType instance = GW::Constants::InstanceType::Loading;
         uint32_t width = 0, height = 0;
         int quality = 1, relaxation = 0, restarts = 0, end_portal = -1;
-        int reveal_radius = 1;
+        int reveal_radius = 1, previous_reveal_radius = 1;
         bool include_outside = false;
         float entry_margin = 192.f;
         std::unordered_set<uint32_t> skipped;
@@ -921,6 +953,7 @@ namespace {
         GW::Constants::InstanceType instance = GW::Constants::InstanceType::Loading;
         GW::GamePos origin{};
         uint32_t width = 0;
+        int reveal_radius = 1;
         int useful = 0, unexplored = 0, border = 0;
         bool connected = false;
         float length = 0.f, milliseconds = 0.f;
@@ -997,6 +1030,7 @@ namespace {
         snapshot->quality = optimization_quality;
         snapshot->relaxation = relaxation_passes;
         snapshot->reveal_radius = birds_eye_compass ? 3 : 1;
+        snapshot->previous_reveal_radius = route_reveal_radius;
         snapshot->include_outside = include_outside_squares;
         snapshot->entry_margin = waypoint_entry_margin;
         snapshot->skipped = skipped_fog;
@@ -1110,6 +1144,7 @@ namespace {
         result.instance = snapshot.instance;
         result.origin = snapshot.player;
         result.width = snapshot.width;
+        result.reveal_radius = snapshot.reveal_radius;
         const auto log_build = [&](const char *state, size_t = 0, size_t = 0, size_t = 0, size_t = 0) { result.status = state; };
         const int quality = std::clamp(snapshot.quality, 0, 2);
         const int two_opt_passes = std::array{8, 16, 24}[quality];
@@ -1342,6 +1377,7 @@ namespace {
         // Carry useful stops forward at their exact positions. Revalidate them
         // against the new mesh, zone bounds and remaining discovery targets.
         for (const auto &point : snapshot.previous_waypoints) {
+            if (snapshot.previous_reveal_radius != snapshot.reveal_radius) break;
             check();
             GW::Vec2f world;
             if (!game_to_world(point, world, display_map)) continue;
@@ -1469,8 +1505,9 @@ namespace {
         };
 
         const auto start_row = search(start, player->pos);
-        std::erase_if(candidates, [&](const Candidate& candidate) {
+        std::erase_if(candidates, [&](Candidate& candidate) {
             const float cost = connection_cost(*start_row, start, player->pos, candidate.trap, candidate.pos);
+            candidate.approach_cost = cost;
             return !std::isfinite(cost) || cost == FLT_MAX;
         });
         remaining.clear();
@@ -1510,7 +1547,8 @@ namespace {
                 if (!newly_revealed) continue;
                 if (border_pass && !border_revealed) continue;
                 const int value = newly_revealed + border_revealed * 4;
-                if (value > best_value) {
+                if (value > best_value || (value == best_value &&
+                    (best == candidates.size() || candidates[i].approach_cost + .1f < candidates[best].approach_cost))) {
                     best_value = value;
                     best = i;
                 }
@@ -1821,6 +1859,7 @@ namespace {
             build_status = "Player moved; refreshing route";
             return;
         }
+        route_reveal_radius = result.reveal_radius;
         route = std::move(result.route);
         route_waypoints = std::move(result.waypoints);
         route_waypoint_reveals = std::move(result.reveals);
