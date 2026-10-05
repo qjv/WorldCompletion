@@ -2,6 +2,8 @@
 """Exercise the production planner on Linux with POD stand-ins for game/GUI data."""
 
 from pathlib import Path
+import gzip
+import os
 import subprocess
 import tempfile
 
@@ -24,6 +26,7 @@ def block(marker):
 
 stubs = r"""
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cassert>
 #include <cfloat>
@@ -40,6 +43,10 @@ stubs = r"""
 #include "plugins/WorldCompletion/RoutePlanner.h"
 #include "plugins/WorldCompletion/VisitHistory.h"
 #include "plugins/WorldCompletion/PortalBarrier.h"
+#include "plugins/WorldCompletion/CoverageOptimizer.h"
+#include "plugins/WorldCompletion/SpatialSeeds.h"
+#include "plugins/WorldCompletion/RegionCoveragePlanner.h"
+#include "plugins/WorldCompletion/CoveringTourSearch.h"
 #include "plugins/WorldCompletion/PortalLocations.h"
 namespace GW {
     struct Vec2f { float x = 0, y = 0; };
@@ -125,17 +132,25 @@ markers = [
     "bool PointerInArray(", "struct SnapshotPlane {", "struct BuildSnapshot {", "struct BuildResult {",
     "struct BuildCancelled {", "void BuildRoute(const BuildSnapshot &",
 ]
-with tempfile.TemporaryDirectory(prefix="worldcompletion-tests-") as temp:
-    temp = Path(temp)
-    fixture = temp / "snapshot.cpp"
-    fixture.write_text(stubs + "\n" + "\n\n".join(block(marker) +
-                       ("\nstd::vector<DiscoveryVisit> pending_discovery;" if marker == "struct DiscoveryVisit {" else "") for marker in markers)
-                       + "\n" + (ROOT / "tests/snapshot_test.cpp").read_text())
-    for name, path in [("order", ROOT / "tests/route_planner_test.cpp"), ("snapshot", fixture),
-                       ("history", ROOT / "tests/visit_history_test.cpp"),
-                       ("navigation", ROOT / "tests/navigation_monitor_test.cpp"),
-                       ("portal", ROOT / "tests/portal_barrier_test.cpp")]:
-        binary = temp / name
-        subprocess.run(["g++", "-std=c++20", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-                        "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(ROOT), str(path), "-o", str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory(prefix="worldcompletion-tests-") as temp:
+        temp = Path(temp)
+        regression_replay = temp / "sparkfly-order.wcrp"
+        regression_replay.write_bytes(gzip.decompress((ROOT / "tests/data/sparkfly-swamp-order-213.wcrp.gz").read_bytes()))
+        fixture = temp / "snapshot.cpp"
+        fixture.write_text(stubs + "\n" + "\n\n".join(block(marker) +
+                           ("\nstd::vector<DiscoveryVisit> pending_discovery;" if marker == "struct DiscoveryVisit {" else "") for marker in markers)
+                           + "\n" + (ROOT / "tests/snapshot_test.cpp").read_text())
+        for name, path in [("order", ROOT / "tests/route_planner_test.cpp"), ("snapshot", fixture),
+                           ("history", ROOT / "tests/visit_history_test.cpp"),
+                           ("navigation", ROOT / "tests/navigation_monitor_test.cpp"),
+                           ("portal", ROOT / "tests/portal_barrier_test.cpp"),
+                       ("coverage", ROOT / "tests/coverage_optimizer_test.cpp"),
+                       ("region", ROOT / "tests/region_coverage_test.cpp"),
+                       ("covering", ROOT / "tests/covering_tour_test.cpp")]:
+            binary = temp / name
+            subprocess.run(["g++", "-std=c++20", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+                            "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(ROOT), str(path), "-o", str(binary)], check=True)
+            env = os.environ.copy()
+            if name == "snapshot": env["WC_REGRESSION_REPLAY"] = str(regression_replay)
+            subprocess.run([str(binary)], check=True, env=env)

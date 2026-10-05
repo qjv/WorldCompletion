@@ -4,6 +4,11 @@
 #include "VisitHistory.h"
 #include "NavigationMonitor.h"
 #include "PortalBarrier.h"
+#include "CoverageOptimizer.h"
+#include "ReplaySnapshot.h"
+#include "SpatialSeeds.h"
+#include "RegionCoveragePlanner.h"
+#include "CoveringTourSearch.h"
 
 #include <chrono>
 #include <future>
@@ -153,6 +158,7 @@ namespace {
     size_t ground_segments_drawn = 0;
     bool route_connected = false;
     float route_length = 0.f;
+    completion::CoverageStats refinement_stats;
     std::ofstream debug_log;
     std::string last_log_summary;
     bool addon_enabled = true;
@@ -200,6 +206,7 @@ namespace {
     std::vector<DiscoveryVisit> pending_discovery;
     completion::VisitHistory visit_history;
     std::filesystem::path visit_history_path;
+    bool replay_capture_requested = true;
     std::future<bool> visit_history_save;
     std::string history_character, history_status = "Ready";
     uint32_t history_map = 0, history_width = 0, last_history_save = 0;
@@ -310,6 +317,7 @@ namespace {
         cartography_snapshot.clear();
         route_connected = false;
         route_reveal_radius = 1;
+        refinement_stats = {};
         route_map = GW::Constants::MapID::None;
         route_instance = GW::Constants::InstanceType::Loading;
         ground_vertices_dirty = true;
@@ -349,7 +357,11 @@ namespace {
             << " state=" << state << " trapezoids=" << trapezoids << " reachable=" << reachable << " stand_cells=" << stand_cells
             << " useful=" << useful_candidates << " fog=" << unexplored_reachable << " border_fog=" << unexplored_border
             << " route=" << route.size() << " route_length=" << route_length << " waypoints=" << route_waypoints.size()
-            << " uncovered_after_route=" << uncovered_after_route;
+            << " uncovered_after_route=" << uncovered_after_route
+            << " refinement_before=" << refinement_stats.before << " refinement_after=" << refinement_stats.after
+            << " cover_trials=" << refinement_stats.trials << " moved=" << refinement_stats.moves
+            << " merged=" << refinement_stats.merges << " repairs=" << refinement_stats.repairs
+            << " refinement_budget=" << refinement_stats.budget_exhausted;
         const std::string summary = out.str();
         if (summary == last_log_summary) return;
         last_log_summary = summary;
@@ -935,6 +947,13 @@ namespace {
         uint32_t width = 0, height = 0;
         int quality = 1, relaxation = 0, restarts = 0, end_portal = -1;
         int reveal_radius = 1, previous_reveal_radius = 1;
+        int replay_budget_ms = 0;
+        bool region_planner = false;
+        bool covering_planner = false;
+        uint32_t covering_seed = 0;
+        int covering_shortlist = 12, covering_removal = 4;
+        int navigation_samples = 1;
+        bool covering_project = false;
         bool include_outside = false;
         float entry_margin = 192.f;
         std::unordered_set<uint32_t> skipped;
@@ -957,6 +976,8 @@ namespace {
         int useful = 0, unexplored = 0, border = 0;
         bool connected = false;
         float length = 0.f, milliseconds = 0.f;
+        completion::CoverageStats refinement;
+        size_t regions = 0, region_patterns = 0;
         std::string status;
     };
 
@@ -1028,6 +1049,9 @@ namespace {
         snapshot->map = GW::Map::GetMapID();
         snapshot->instance = GW::Map::GetInstanceType();
         snapshot->quality = optimization_quality;
+        snapshot->covering_planner = true;
+        snapshot->covering_seed = 1;
+        snapshot->navigation_samples = 3;
         snapshot->relaxation = relaxation_passes;
         snapshot->reveal_radius = birds_eye_compass ? 3 : 1;
         snapshot->previous_reveal_radius = route_reveal_radius;
@@ -1434,11 +1458,16 @@ namespace {
                     if (visited.contains(next)) continue;
                     const auto portal = SharedPortal(&trap, next);
                     if (!portal) continue;
-                    const size_t id = nodes.size();
-                    nodes.push_back(
-                        {&trap, next, *portal, {(portal->first.x + portal->second.x) * .5f, (portal->first.y + portal->second.y) * .5f}});
-                    incident[&trap].push_back(id);
-                    incident[next].push_back(id);
+                    const int samples = snapshot.navigation_samples >= 3 ? 3 : 1;
+                    for (int sample = 0; sample < samples; ++sample) {
+                        const float fraction = sample == 0 ? .5f : sample == 1 ? .0001f : .9999f;
+                        const size_t id = nodes.size();
+                        nodes.push_back({&trap, next, *portal,
+                            {portal->first.x + (portal->second.x - portal->first.x) * fraction,
+                             portal->first.y + (portal->second.y - portal->first.y) * fraction}});
+                        incident[&trap].push_back(id);
+                        incident[next].push_back(id);
+                    }
                 }
             }
         }
@@ -1451,10 +1480,16 @@ namespace {
             std::vector<size_t> parent;
         };
         using SearchKey = std::tuple<const GW::PathingTrapezoid *, float, float>;
-        std::map<SearchKey, std::shared_ptr<Search>> searches;
+        std::map<SearchKey, std::pair<std::shared_ptr<Search>, uint64_t>> searches;
+        uint64_t search_clock = 0;
+        const size_t row_bytes = std::max(size_t{1}, nodes.size() * (sizeof(float) + sizeof(size_t)));
+        const size_t cache_limit = std::clamp((size_t{32} * 1024 * 1024) / row_bytes, size_t{2}, size_t{1024});
         const auto search = [&](const GW::PathingTrapezoid *from, const GW::GamePos &point) {
             const SearchKey key{from, point.x, point.y};
-            if (const auto found = searches.find(key); found != searches.end()) return found->second;
+            if (const auto found = searches.find(key); found != searches.end()) {
+                found->second.second = ++search_clock;
+                return found->second.first;
+            }
             auto row = std::make_shared<Search>();
             row->distance.assign(nodes.size(), FLT_MAX);
             row->parent.assign(nodes.size(), nodes.size());
@@ -1484,8 +1519,11 @@ namespace {
                     }
                 }
             }
-            if (searches.size() >= 32) searches.clear();
-            searches.emplace(key, row);
+            if (searches.size() >= cache_limit) {
+                const auto oldest = std::min_element(searches.begin(), searches.end(), [](const auto& a, const auto& b) { return a.second.second < b.second.second; });
+                searches.erase(oldest);
+            }
+            searches.emplace(key, std::pair{row, ++search_clock});
             return row;
         };
         const auto destination = [&](const Search &row, const GW::PathingTrapezoid *to, const GW::GamePos &point) {
@@ -1502,6 +1540,127 @@ namespace {
                                          const GW::PathingTrapezoid *to, const GW::GamePos &b) {
             if (from == to && avoids_doors({a.x, a.y}, {b.x, b.y}, static_cast<uint32_t>(planes.at(from)))) return hypotf(b.x - a.x, b.y - a.y);
             return destination(row, to, b).first;
+        };
+
+        const auto make_leg = [&](const GW::PathingTrapezoid *from, const GW::GamePos &origin, const GW::PathingTrapezoid *to, const GW::GamePos &goal, std::vector<GW::GamePos> &leg) {
+            leg.clear();
+            leg.push_back(origin);
+            // Midpoint Dijkstra can choose a longer corridor even when a direct
+            // segment crosses valid connected polygons. Verify that segment
+            // through declared portals before accepting the approximate corridor.
+            if (planes.at(from) == planes.at(to) && avoids_doors({origin.x, origin.y}, {goal.x, goal.y}, static_cast<uint32_t>(planes.at(from)))) {
+                const completion::Point direction{goal.x - origin.x, goal.y - origin.y};
+                const float length_sq = direction.x * direction.x + direction.y * direction.y;
+                std::deque<std::pair<const GW::PathingTrapezoid*, float>> crossing{{from, 0.f}};
+                std::unordered_map<const GW::PathingTrapezoid*, float> entered{{from, 0.f}};
+                size_t examined = 0;
+                while (!crossing.empty() && examined++ < 256) {
+                    check();
+                    const auto [trap, previous] = crossing.front();
+                    crossing.pop_front();
+                    if (trap == to) { leg.push_back(goal); return true; }
+                    for (const size_t id : incident[trap]) {
+                        const auto& node = nodes[id];
+                        const auto* next = node.a == trap ? node.b : node.a;
+                        if (planes.at(next) != planes.at(from)) continue;
+                        const auto edge = completion::Sub(node.edge.second, node.edge.first);
+                        const auto offset = completion::Sub(node.edge.first, {origin.x, origin.y});
+                        const float denominator = completion::Cross(direction, edge);
+                        float parameter;
+                        if (std::fabs(denominator) < .00001f) {
+                            if (length_sq < .00001f || std::fabs(completion::Cross(direction, offset)) > .001f * std::sqrt(length_sq)) continue;
+                            const auto far_offset = completion::Sub(node.edge.second, {origin.x, origin.y});
+                            const float a = (offset.x * direction.x + offset.y * direction.y) / length_sq;
+                            const float b = (far_offset.x * direction.x + far_offset.y * direction.y) / length_sq;
+                            parameter = std::max(previous, std::min(a, b));
+                            if (parameter > std::min(1.f, std::max(a, b)) + .000001f) continue;
+                        } else {
+                            parameter = completion::Cross(offset, edge) / denominator;
+                            const float u = completion::Cross(offset, direction) / denominator;
+                            if (parameter + .000001f < previous || parameter < -.000001f || parameter > 1.000001f || u < -.000001f || u > 1.000001f) continue;
+                            parameter = std::max(previous, parameter);
+                        }
+                        const auto found = entered.find(next);
+                        if (found != entered.end() && found->second <= parameter) continue;
+                        entered[next] = parameter;
+                        crossing.emplace_back(next, parameter);
+                    }
+                }
+            }
+            std::vector<size_t> path;
+            if (from != to || !avoids_doors({leg.back().x, leg.back().y}, {goal.x, goal.y}, static_cast<uint32_t>(planes.at(from)))) {
+                const auto row = search(from, leg.back());
+                const auto [cost, last] = destination(*row, to, goal);
+                if (last == nodes.size() || cost == FLT_MAX) return false;
+                for (size_t id = last; id != nodes.size(); id = row->parent[id])
+                    path.push_back(id);
+                std::reverse(path.begin(), path.end());
+            }
+            std::vector<completion::Portal> portals{
+                {{leg.back().x, leg.back().y}, {leg.back().x, leg.back().y}}};
+            std::vector<GW::GamePos> raw{leg.back()};
+            raw.back().zplane = static_cast<uint32_t>(planes.at(from));
+            for (size_t i = 0; i < path.size(); ++i) {
+                check();
+                const auto &node = nodes[path[i]];
+                const GW::PathingTrapezoid *segment_trap = to;
+                if (i + 1 < path.size()) {
+                    const auto &next = nodes[path[i + 1]];
+                    if (node.a == next.a || node.a == next.b)
+                        segment_trap = node.a;
+                    else if (node.b == next.a || node.b == next.b)
+                        segment_trap = node.b;
+                    else
+                        return false;
+                }
+                portals.push_back(node.edge);
+                raw.push_back({node.point.x, node.point.y, static_cast<uint32_t>(planes.at(segment_trap))});
+            }
+            portals.push_back({{goal.x, goal.y}, {goal.x, goal.y}});
+            raw.push_back(goal);
+            for (int pass = 0; pass < 24; ++pass) {
+                check();
+                float movement = 0.f;
+                for (size_t step = 1; step + 1 < raw.size(); ++step) {
+                    check();
+                    const size_t i = pass % 2 ? raw.size() - 1 - step : step;
+                    const auto [a, b] = portals[i];
+                    // The shortest broken line through a portal has a closed
+                    // form (reflect one endpoint across its supporting line).
+                    // Avoid 24 ternary iterations and their square roots for
+                    // every portal, in every smoothing pass, on every trial.
+                    const float t = completion::ShortestPortalParameter(
+                        {raw[i - 1].x, raw[i - 1].y}, {raw[i + 1].x, raw[i + 1].y}, {a, b});
+                    const float x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t;
+                    if (!avoids_doors({raw[i - 1].x, raw[i - 1].y}, {x, y}, raw[i].zplane) || !avoids_doors({x, y}, {raw[i + 1].x, raw[i + 1].y}, raw[i].zplane))
+                        continue;
+                    movement += hypotf(x - raw[i].x, y - raw[i].y);
+                    raw[i].x = x;
+                    raw[i].y = y;
+                }
+                if (movement < .05f) break;
+            }
+            leg.back().zplane = raw.front().zplane;
+            size_t at = 0;
+            while (at + 1 < raw.size()) {
+                check();
+                size_t next = at + 1;
+                size_t furthest = at + 1;
+                while (furthest + 1 < raw.size() && raw[furthest].zplane == raw[at].zplane)
+                    ++furthest;
+                for (size_t candidate = furthest; candidate > at + 1; --candidate) {
+                    check();
+                    if (avoids_doors({raw[at].x, raw[at].y}, {raw[candidate].x, raw[candidate].y}, raw[at].zplane) &&
+                        completion::CrossesPortalsInOrder({raw[at].x, raw[at].y}, {raw[candidate].x, raw[candidate].y}, portals, at + 1,
+                                                          candidate)) {
+                        next = candidate;
+                        break;
+                    }
+                }
+                leg.push_back(raw[next]);
+                at = next;
+            }
+            return true;
         };
 
         const auto start_row = search(start, player->pos);
@@ -1525,7 +1684,7 @@ namespace {
         // set-cover caused the result.route to zig-zag between opposite sides of the map.
         std::vector<size_t> selected;
         for (size_t i = 0; i < candidates.size(); ++i) {
-            if (!candidates[i].preserved || !std::ranges::any_of(candidates[i].reveals, [&](uint32_t fog) { return remaining.contains(fog); })) continue;
+            if (!candidates[i].preserved || candidates[i].reveals.empty()) continue;
             selected.push_back(i);
             for (const auto fog : candidates[i].reveals) remaining.erase(fog);
         }
@@ -1533,20 +1692,17 @@ namespace {
             check();
             size_t best = candidates.size();
             int best_value = -1;
-            const bool border_pass = std::ranges::any_of(border_fog, [&](const uint32_t fog) { return remaining.contains(fog); });
             for (size_t i = 0; i < candidates.size(); i++) {
                 check();
                 int newly_revealed = 0;
-                int border_revealed = 0;
                 for (const auto fog : candidates[i].reveals) {
                     check();
                     if (!remaining.contains(fog)) continue;
                     newly_revealed++;
-                    border_revealed += border_fog.contains(fog);
                 }
                 if (!newly_revealed) continue;
-                if (border_pass && !border_revealed) continue;
-                const int value = newly_revealed + border_revealed * 4;
+                // Coverage first; location has no independent wall/center bias.
+                const int value = newly_revealed;
                 if (value > best_value || (value == best_value &&
                     (best == candidates.size() || candidates[i].approach_cost + .1f < candidates[best].approach_cost))) {
                     best_value = value;
@@ -1570,6 +1726,9 @@ namespace {
         }
         for (size_t i = selected.size(); i-- > 0;) {
             check();
+            // Keep useful existing markers stable. Refinement may remove one
+            // only when the measured walking saving meets its threshold.
+            if (candidates[selected[i]].preserved) continue;
             const auto &reveals = candidates[selected[i]].reveals;
             const bool redundant = std::ranges::all_of(reveals, [&](const uint32_t fog) {
                 const auto found = cover_count.find(fog);
@@ -1603,6 +1762,40 @@ namespace {
                 }
             }
         }
+        bool region_route = false;
+        if (snapshot.region_planner) {
+            std::set<std::tuple<uint32_t, int, int>> grid;
+            for (const auto& [cell, options] : footing_options)
+                for (const auto& option : options) grid.emplace(option.pos.zplane, cell.first, cell.second);
+            std::vector<completion::CoverageGridCell> walkable;
+            for (const auto& [floor, x, y] : grid) walkable.push_back({x, y, floor});
+            Candidate begin, end;
+            begin.trap = start; begin.pos = player->pos;
+            end.trap = end_trap; end.pos = end_point;
+            const auto region_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+                snapshot.replay_budget_ms > 0 ? snapshot.replay_budget_ms : std::array{500, 1500, 3000}[quality]);
+            const auto estimated_metric = [&](const Candidate& a, const Candidate& b) {
+                std::vector<GW::GamePos> leg;
+                if (!make_leg(a.trap, a.pos, b.trap, b.pos, leg)) return std::numeric_limits<float>::infinity();
+                float length = 0.f;
+                for (size_t i = 1; i < leg.size(); ++i) length += hypotf(leg[i].x - leg[i - 1].x, leg[i].y - leg[i - 1].y);
+                return length;
+            };
+            const auto planned = completion::PlanRegionCoverage(candidates, walkable, reveal_radius, width,
+                begin, end_trap ? &end : nullptr, estimated_metric, check,
+                [&] { return std::chrono::steady_clock::now() < region_deadline; });
+            if (!planned.order.empty()) {
+                std::unordered_set<uint32_t> covered;
+                for (const auto i : planned.order) covered.insert(candidates[i].reveals.begin(), candidates[i].reveals.end());
+                const bool complete = std::ranges::all_of(candidates, [&](const Candidate& c) {
+                    return std::ranges::all_of(c.reveals, [&](uint32_t fog) { return covered.contains(fog); });
+                });
+                if (complete) {
+                    selected = planned.order; region_route = true;
+                    result.regions = planned.regions; result.region_patterns = planned.patterns;
+                }
+            }
+        }
         const size_t target_count = selected.size();
         completion::Costs costs(target_count + 1, std::vector<float>(target_count + 1, 0.f));
         std::vector<float> finish(target_count, 0.f);
@@ -1617,12 +1810,17 @@ namespace {
                 if (end_trap && i < target_count) finish[i] = connection_cost(*row, trap_at(i), point_at(i), end_trap, end_point);
             }
         };
-        rebuild_costs();
-        auto order = completion::OptimizeOrder(costs, finish, two_opt_passes, restart_budget, static_cast<uint32_t>(map_id), check);
+        if (!region_route) rebuild_costs();
+        std::vector<completion::Point> selected_cells;
+        for (const auto i : selected) selected_cells.push_back({static_cast<float>(candidates[i].cell_x), static_cast<float>(candidates[i].cell_y)});
+        const auto spatial_seeds = region_route ? std::vector<std::vector<size_t>>{} : completion::SpatialSeeds(selected_cells, 2 * snapshot.reveal_radius + 1, costs, finish);
+        std::vector<size_t> order(target_count);
+        if (region_route) std::iota(order.begin(), order.end(), 0);
+        else order = completion::OptimizeOrder(costs, finish, two_opt_passes, restart_budget, static_cast<uint32_t>(map_id), check, spatial_seeds);
         std::vector<size_t> kept_order;
         for (size_t i = 0; i < selected.size(); ++i)
             if (candidates[selected[i]].preserved) kept_order.push_back(i);
-        const bool preserve_existing_order = !kept_order.empty();
+        const bool preserve_existing_order = !region_route && !kept_order.empty();
         if (preserve_existing_order) {
             for (const size_t target : order) {
                 if (candidates[selected[target]].preserved) continue;
@@ -1639,182 +1837,165 @@ namespace {
                 }
                 kept_order.insert(kept_order.begin() + static_cast<ptrdiff_t>(best), target);
             }
-            order = std::move(kept_order);
+            order = completion::StableOrder(costs, finish, std::move(order), std::move(kept_order));
         }
-        const auto morph_options = candidates;
-        for (int pass = 0; pass < relaxation_budget; ++pass) {
+        std::vector<Candidate> refined_stops;
+        for (const auto index : order) refined_stops.push_back(candidates[selected[index]]);
+        Candidate start_stop, finish_stop;
+        start_stop.pos = player->pos;
+        start_stop.trap = start;
+        finish_stop.pos = end_point;
+        finish_stop.trap = end_trap;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(snapshot.replay_budget_ms > 0 ? snapshot.replay_budget_ms : snapshot.region_planner ? 500 : std::array{500, 3000, 6000}[quality]);
+        size_t distance_queries = 0;
+        const auto within_budget = [&] {
+            return (snapshot.replay_budget_ms > 0 || distance_queries < std::array<size_t, 3>{16384, 65536, 131072}[quality]) && std::chrono::steady_clock::now() < deadline;
+        };
+        using LegKey = std::tuple<const GW::PathingTrapezoid*, float, float, const GW::PathingTrapezoid*, float, float>;
+        std::map<LegKey, float> leg_costs;
+        const auto metric = [&](const Candidate &from, const Candidate &to) {
             check();
-            bool improved = false;
-            for (size_t step = 0; step < order.size(); ++step) {
-                check();
-                const size_t position = pass % 2 ? order.size() - 1 - step : step;
-                auto &current = candidates[selected[order[position]]];
-                if (current.preserved) continue;
-                for (const uint32_t fog : current.reveals)
-                    --cover_count[fog];
-                std::vector<uint32_t> required;
-                for (const uint32_t fog : current.reveals)
-                    if (!cover_count[fog]) required.push_back(fog);
-                const auto *previous_trap = position ? trap_at(order[position - 1]) : start;
-                const auto previous_point = position ? point_at(order[position - 1]) : player->pos;
-                const auto *next_trap = position + 1 < order.size() ? trap_at(order[position + 1]) : end_trap;
-                const auto next_point = position + 1 < order.size() ? point_at(order[position + 1]) : end_point;
-                const auto previous_row = search(previous_trap, previous_point);
-                const auto next_row = next_trap ? search(next_trap, next_point) : nullptr;
-                const auto score = [&](const Candidate &option) {
-                    return connection_cost(*previous_row, previous_trap, previous_point, option.trap, option.pos) +
-                           (next_row ? connection_cost(*next_row, next_trap, next_point, option.trap, option.pos) : 0.f);
-                };
-                Candidate best = current;
-                float best_cost = score(best);
-                const auto consider = [&](const Candidate &option) {
-                    if (!std::ranges::all_of(required,
-                                             [&](uint32_t fog) { return std::ranges::find(option.reveals, fog) != option.reveals.end(); }))
-                        return;
-                    const float cost = score(option);
-                    if (cost + .1f >= best_cost) return;
-                    best_cost = cost;
-                    best = option;
-                    improved = true;
-                };
-                if (const auto found = footing_options.find({current.cell_x, current.cell_y}); found != footing_options.end())
-                    for (const auto &option : found->second)
-                        consider(option);
-                for (const auto &option : morph_options)
-                    consider(option);
-                GW::Vec2f game_a, game_b;
-                if (world_to_game({std::max(best.cell_x * kWorldUnitsPerCell, snapshot.discovery_bounds.Min.x),
-                                   std::max(best.cell_y * kWorldUnitsPerCell, snapshot.discovery_bounds.Min.y)}, game_a, display_map) &&
-                    world_to_game({std::min((best.cell_x + 1) * kWorldUnitsPerCell, snapshot.discovery_bounds.Max.x),
-                                   std::min((best.cell_y + 1) * kWorldUnitsPerCell, snapshot.discovery_bounds.Max.y)}, game_b, display_map)) {
-                    const Candidate base = best;
-                    const GW::Vec2f box_min{std::min(game_a.x, game_b.x), std::min(game_a.y, game_b.y)};
-                    const GW::Vec2f box_max{std::max(game_a.x, game_b.x), std::max(game_a.y, game_b.y)};
-                    for (int sample = 0; sample <= (next_trap ? 8 : 0); ++sample) {
-                        check();
-                        const float t = static_cast<float>(sample) / 8.f;
-                        const GW::Vec2f preferred{previous_point.x + t * (next_point.x - previous_point.x),
-                                                 previous_point.y + t * (next_point.y - previous_point.y)};
-                        GW::Vec2f footing;
-                        float area;
-                        if (!TrapezoidCellOverlap(base.trap, box_min, box_max, footing, area, &preferred, snapshot.entry_margin)) continue;
-                        if (IsBeyondKnownPortal(footing, path_min, path_max, static_cast<uint32_t>(snapshot.map), &path_doorways)) continue;
-                        Candidate option = base;
-                        option.pos = {footing.x, footing.y, base.pos.zplane};
-                        consider(option);
-                    }
-                }
-                current = std::move(best);
-                for (const uint32_t fog : current.reveals)
-                    ++cover_count[fog];
+            const LegKey key{from.trap, from.pos.x, from.pos.y, to.trap, to.pos.x, to.pos.y};
+            if (const auto found = leg_costs.find(key); found != leg_costs.end()) return found->second;
+            ++distance_queries;
+            std::vector<GW::GamePos> leg;
+            float length = std::numeric_limits<float>::infinity();
+            if (from.trap && to.trap && make_leg(from.trap, from.pos, to.trap, to.pos, leg)) {
+                length = 0.f;
+                for (size_t i = 1; i < leg.size(); ++i) length += hypotf(leg[i].x - leg[i - 1].x, leg[i].y - leg[i - 1].y);
             }
-            if (!improved) break;
-            rebuild_costs();
-            if (!preserve_existing_order) order = completion::OptimizeOrder(costs, finish, two_opt_passes, 0, 0, check);
-        }
-
-        for (size_t position = order.size(); position-- > 0;) {
+            leg_costs.emplace(key, length);
+            return length;
+        };
+        const auto order_stops = [&](std::vector<Candidate> stops, const Candidate &before, const Candidate *after) {
+            const size_t n = stops.size();
+            if (!n || !within_budget()) return stops;
+            completion::Costs exact_costs(n + 1, std::vector<float>(n + 1));
+            std::vector<float> exact_finish(n, 0.f);
+            for (size_t i = 0; i < n; ++i) {
+                check();
+                if (!within_budget()) return stops;
+                exact_costs[n][i] = metric(before, stops[i]);
+                exact_costs[i][n] = metric(stops[i], before);
+                if (after) exact_finish[i] = metric(stops[i], *after);
+                for (size_t j = 0; j < n; ++j) if (i != j) {
+                    if (!within_budget()) return stops;
+                    exact_costs[i][j] = metric(stops[i], stops[j]);
+                }
+            }
+            std::vector<completion::Point> cells;
+            for (const auto& stop : stops) cells.push_back({static_cast<float>(stop.cell_x), static_cast<float>(stop.cell_y)});
+            const auto seeds = completion::SpatialSeeds(cells, 2 * snapshot.reveal_radius + 1, exact_costs, exact_finish);
+            const auto visit_order = completion::OptimizeOrder(exact_costs, exact_finish, two_opt_passes,
+                n > 15 ? std::min(restart_budget, 4) : 0, static_cast<uint32_t>(map_id), check, seeds);
+            if (visit_order.size() != n) return stops;
+            std::vector<Candidate> ordered;
+            for (const auto i : visit_order) ordered.push_back(stops[i]);
+            return ordered;
+        };
+        auto coverage_pool = candidates;
+        for (const auto &[cell, options] : footing_options) {
             check();
-            const auto &reveals = candidates[selected[order[position]]].reveals;
-            if (!std::ranges::all_of(reveals, [&](uint32_t fog) { return cover_count[fog] > 1; })) continue;
-            for (const uint32_t fog : reveals)
-                --cover_count[fog];
-            order.erase(order.begin() + static_cast<ptrdiff_t>(position));
+            for (auto option : options) {
+                if (option.reveals.empty()) continue;
+                option.approach_cost = hypotf(option.pos.x - player->pos.x, option.pos.y - player->pos.y);
+                coverage_pool.push_back(std::move(option));
+            }
         }
-        if (order.empty() && !end_trap) {
+        const auto place_stop = [&](const Candidate &current, const Candidate &before, const Candidate *after) {
+            std::vector<Candidate> options{current};
+            const auto add_positions = [&](const Candidate &base) {
+                GW::Vec2f game_a, game_b;
+                if (!world_to_game({std::max(base.cell_x * kWorldUnitsPerCell, snapshot.discovery_bounds.Min.x),
+                                   std::max(base.cell_y * kWorldUnitsPerCell, snapshot.discovery_bounds.Min.y)}, game_a, display_map) ||
+                    !world_to_game({std::min((base.cell_x + 1) * kWorldUnitsPerCell, snapshot.discovery_bounds.Max.x),
+                                   std::min((base.cell_y + 1) * kWorldUnitsPerCell, snapshot.discovery_bounds.Max.y)}, game_b, display_map)) return;
+                const GW::Vec2f lo{std::min(game_a.x, game_b.x), std::min(game_a.y, game_b.y)};
+                const GW::Vec2f hi{std::max(game_a.x, game_b.x), std::max(game_a.y, game_b.y)};
+                const auto next = after ? after->pos : before.pos;
+                for (int sample = 0; sample <= (after ? 8 : 0); ++sample) {
+                    check();
+                    const float fraction = sample / 8.f;
+                    const GW::Vec2f preferred{before.pos.x + fraction * (next.x - before.pos.x), before.pos.y + fraction * (next.y - before.pos.y)};
+                    GW::Vec2f point;
+                    float area;
+                    if (!TrapezoidCellOverlap(base.trap, lo, hi, point, area, &preferred, snapshot.entry_margin) ||
+                        IsBeyondKnownPortal(point, path_min, path_max, static_cast<uint32_t>(snapshot.map), &path_doorways)) continue;
+                    Candidate option = base;
+                    option.pos = {point.x, point.y, base.pos.zplane};
+                    options.push_back(std::move(option));
+                }
+            };
+            add_positions(current);
+            // Bound alternatives by proximity; final acceptance uses actual walking.
+            std::vector<const Candidate*> nearby;
+            for (const auto &option : coverage_pool) {
+                if (std::ranges::any_of(current.reveals, [&](uint32_t fog) { return std::ranges::find(option.reveals, fog) != option.reveals.end(); }))
+                    nearby.push_back(&option);
+            }
+            const auto proximity = [&](const Candidate *option) {
+                return hypotf(option->pos.x - before.pos.x, option->pos.y - before.pos.y) +
+                    (after ? hypotf(option->pos.x - after->pos.x, option->pos.y - after->pos.y) : 0.f);
+            };
+            const size_t count = std::min(size_t{12}, nearby.size());
+            std::partial_sort(nearby.begin(), nearby.begin() + static_cast<ptrdiff_t>(count), nearby.end(),
+                [&](const Candidate *a, const Candidate *b) { return proximity(a) < proximity(b); });
+            for (size_t i = 0; i < count; ++i) { options.push_back(*nearby[i]); add_positions(*nearby[i]); }
+            return options;
+        };
+        if (snapshot.covering_planner && relaxation_budget > 0) {
+            const auto original_stops = refined_stops;
+            const auto walking_cost = [&](const std::vector<Candidate>& stops) {
+                float length = 0.f;
+                const Candidate* previous = &start_stop;
+                for (const auto& stop : stops) { length += metric(*previous, stop); previous = &stop; }
+                return length + (end_trap ? metric(*previous, finish_stop) : 0.f);
+            };
+            const float original_cost = walking_cost(original_stops);
+            // A small tour can be ordered exactly using the rendered legs. Do
+            // this before expensive changes to coverage, so a short budget can
+            // still eliminate backtracking without moving or adding stops.
+            auto stable_stops = original_stops;
+            float stable_cost = original_cost;
+            if (refined_stops.size() <= 15) {
+                auto ordered_stops = order_stops(refined_stops, start_stop, end_trap ? &finish_stop : nullptr);
+                const float ordered_cost = walking_cost(ordered_stops);
+                if (ordered_cost + std::max(256.f, original_cost * .005f) < original_cost) {
+                    stable_stops = std::move(ordered_stops);
+                    stable_cost = ordered_cost;
+                }
+            }
+            refined_stops = stable_stops;
+            refined_stops = completion::ImproveCoveringTour(std::move(refined_stops), coverage_pool, start_stop,
+                end_trap ? &finish_stop : nullptr, snapshot.covering_seed ? snapshot.covering_seed : static_cast<uint32_t>(map_id),
+                metric, check, within_budget, result.refinement, place_stop, snapshot.covering_shortlist, snapshot.covering_removal, snapshot.covering_project);
+            result.refinement.before = original_cost;
+            if (!snapshot.previous_waypoints.empty() && result.refinement.before - result.refinement.after <
+                std::max(1024.f, result.refinement.before * .05f)) {
+                refined_stops = std::move(stable_stops);
+                result.refinement.after = stable_cost;
+                result.refinement.merges = 0;
+            }
+        } else {
+            refined_stops = completion::ImproveCoverageRoute(std::move(refined_stops), coverage_pool, start_stop,
+                end_trap ? &finish_stop : nullptr, relaxation_budget, restart_budget, static_cast<uint32_t>(map_id),
+                metric, place_stop, order_stops, check, within_budget, result.refinement);
+        }
+        if (refined_stops.empty() && !end_trap) {
             log_build("nothing_reachable_to_discover");
             return;
         }
         result.route.push_back(player->pos);
         const auto append_leg = [&](const GW::PathingTrapezoid *from, const GW::PathingTrapezoid *to, const GW::GamePos &goal) {
-            std::vector<size_t> path;
-            if (from != to || !avoids_doors({result.route.back().x, result.route.back().y}, {goal.x, goal.y}, static_cast<uint32_t>(planes.at(from)))) {
-                const auto row = search(from, result.route.back());
-                const auto [cost, last] = destination(*row, to, goal);
-                if (last == nodes.size() || cost == FLT_MAX) return false;
-                for (size_t id = last; id != nodes.size(); id = row->parent[id])
-                    path.push_back(id);
-                std::reverse(path.begin(), path.end());
-            }
-            std::vector<completion::Portal> portals{
-                {{result.route.back().x, result.route.back().y}, {result.route.back().x, result.route.back().y}}};
-            std::vector<GW::GamePos> raw{result.route.back()};
-            raw.back().zplane = static_cast<uint32_t>(planes.at(from));
-            for (size_t i = 0; i < path.size(); ++i) {
-                check();
-                const auto &node = nodes[path[i]];
-                const GW::PathingTrapezoid *segment_trap = to;
-                if (i + 1 < path.size()) {
-                    const auto &next = nodes[path[i + 1]];
-                    if (node.a == next.a || node.a == next.b)
-                        segment_trap = node.a;
-                    else if (node.b == next.a || node.b == next.b)
-                        segment_trap = node.b;
-                    else
-                        return false;
-                }
-                portals.push_back(node.edge);
-                raw.push_back({node.point.x, node.point.y, static_cast<uint32_t>(planes.at(segment_trap))});
-            }
-            portals.push_back({{goal.x, goal.y}, {goal.x, goal.y}});
-            raw.push_back(goal);
-            for (int pass = 0; pass < 24; ++pass) {
-                check();
-                float movement = 0.f;
-                for (size_t step = 1; step + 1 < raw.size(); ++step) {
-                    check();
-                    const size_t i = pass % 2 ? raw.size() - 1 - step : step;
-                    const auto [a, b] = portals[i];
-                    const auto objective = [&](float t) {
-                        const completion::Point point{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t};
-                        return completion::Distance(point, {raw[i - 1].x, raw[i - 1].y}) +
-                               completion::Distance(point, {raw[i + 1].x, raw[i + 1].y});
-                    };
-                    float low = 0.f, high = 1.f;
-                    for (int iteration = 0; iteration < 24; ++iteration) {
-                        check();
-                        const float left = (2.f * low + high) / 3.f, right = (low + 2.f * high) / 3.f;
-                        if (objective(left) <= objective(right))
-                            high = right;
-                        else
-                            low = left;
-                    }
-                    const float t = (low + high) * .5f;
-                    const float x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t;
-                    if (!avoids_doors({raw[i - 1].x, raw[i - 1].y}, {x, y}, raw[i].zplane) || !avoids_doors({x, y}, {raw[i + 1].x, raw[i + 1].y}, raw[i].zplane))
-                        continue;
-                    movement += hypotf(x - raw[i].x, y - raw[i].y);
-                    raw[i].x = x;
-                    raw[i].y = y;
-                }
-                if (movement < .05f) break;
-            }
-            result.route.back().zplane = raw.front().zplane;
-            size_t at = 0;
-            while (at + 1 < raw.size()) {
-                check();
-                size_t next = at + 1;
-                size_t furthest = at + 1;
-                while (furthest + 1 < raw.size() && raw[furthest].zplane == raw[at].zplane)
-                    ++furthest;
-                for (size_t candidate = furthest; candidate > at + 1; --candidate) {
-                    check();
-                    if (avoids_doors({raw[at].x, raw[at].y}, {raw[candidate].x, raw[candidate].y}, raw[at].zplane) &&
-                        completion::CrossesPortalsInOrder({raw[at].x, raw[at].y}, {raw[candidate].x, raw[candidate].y}, portals, at + 1,
-                                                          candidate)) {
-                        next = candidate;
-                        break;
-                    }
-                }
-                result.route.push_back(raw[next]);
-                at = next;
-            }
+            std::vector<GW::GamePos> leg;
+            if (!make_leg(from, result.route.back(), to, goal, leg)) return false;
+            result.route.back().zplane = leg.front().zplane;
+            result.route.insert(result.route.end(), leg.begin() + 1, leg.end());
             return true;
         };
         const auto *from = start;
-        for (const size_t index : order) {
+        for (const auto &target : refined_stops) {
             check();
-            const auto &target = candidates[selected[index]];
             if (!append_leg(from, target.trap, target.pos)) {
                 result.route.clear();
                 log_build("disconnected_target");
@@ -1872,6 +2053,7 @@ namespace {
         unexplored_border = result.border;
         route_connected = result.connected;
         route_length = result.length;
+        refinement_stats = result.refinement;
         route_map = result.map;
         route_instance = result.instance;
         route_progress = ground_progress = 0;
@@ -1896,10 +2078,17 @@ namespace {
         if (cartography_snapshot.size() != snapshot->bits.size()) cartography_snapshot = snapshot->bits;
         build_cancel = std::make_shared<std::atomic_bool>(false);
         build_status = "Optimizing route in background";
-        build_future = std::async(std::launch::async, [snapshot = std::move(snapshot), cancelled = build_cancel]() mutable {
+        const auto replay_path = replay_capture_requested && !visit_history_path.empty()
+            ? visit_history_path.parent_path() / L"WorldCompletion.route-replay" : std::filesystem::path{};
+        if (!replay_path.empty()) replay_capture_requested = false;
+        build_future = std::async(std::launch::async, [snapshot = std::move(snapshot), cancelled = build_cancel, replay_path]() mutable {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             BuildResult result;
             const auto begin = std::chrono::steady_clock::now();
+            if (!replay_path.empty()) {
+                try { completion::SaveReplaySnapshot(*snapshot, replay_path); }
+                catch (const std::exception &) { /* Diagnostics must not interrupt routing. */ }
+            }
             try {
                 BuildRoute(*snapshot, result, *cancelled);
             }
@@ -2557,8 +2746,15 @@ void WorldCompletionPlugin::DrawSettings()
     ImGui::TextWrapped("The buff is detected automatically. The route rebuilds when it appears or expires.");
     optimization_changed |= ImGui::SliderFloat("Waypoint entry margin", &waypoint_entry_margin, 64.f, 512.f, "%.0f game units");
     ImGui::TextWrapped("Stops stay visible until discovery is confirmed. Larger margins enter squares deeper; tiny overlaps use a smaller margin.");
-    optimization_changed |= ImGui::SliderInt("Relaxation passes", &relaxation_passes, 0, 8);
-    optimization_changed |= ImGui::SliderInt("Randomized restarts", &randomized_restarts, 0, 12);
+    optimization_changed |= ImGui::SliderInt("Coverage refinement passes", &relaxation_passes, 0, 8);
+    if (ImGui::Button("Capture route replay")) {
+        replay_capture_requested = true;
+        recompute_requested.store(true);
+    }
+    ImGui::Text("Refinement: %.0f -> %.0f game units", refinement_stats.before, refinement_stats.after);
+    ImGui::Text("Trials: %u, moves: %u, merged stops: %u, repairs: %u", refinement_stats.trials, refinement_stats.moves, refinement_stats.merges, refinement_stats.repairs);
+    if (refinement_stats.budget_exhausted) ImGui::TextUnformatted("Refinement reached its background work budget.");
+    optimization_changed |= ImGui::SliderInt("Alternative seed orders", &randomized_restarts, 0, 12);
     if (optimization_changed) recompute_requested.store(true, std::memory_order_release);
     ImGui::TextUnformatted("Click a portal marker on the mission map to choose the route endpoint.");
 }

@@ -1,3 +1,6 @@
+#include "plugins/WorldCompletion/ReplaySnapshot.h"
+#include <cstdlib>
+
 static SnapshotPlane Plane(std::initializer_list<std::array<float, 4>> boxes, uintptr_t base)
 {
     SnapshotPlane plane;
@@ -63,6 +66,68 @@ static void Validate(const BuildSnapshot& snapshot, const BuildResult& result)
 
 int main()
 {
+    if (const auto* path = std::getenv("WC_REGRESSION_REPLAY")) {
+        CartographyData::Mask mask{};
+        std::vector<uint8_t> bytes;
+        auto snapshot = completion::LoadReplaySnapshot<BuildSnapshot>(path, mask, bytes);
+        assert(snapshot.previous_waypoints.size() >= 3);
+        const auto one = snapshot.previous_waypoints[0], three = snapshot.previous_waypoints[2];
+        snapshot.player = one;
+        snapshot.previous_waypoints.clear();
+        snapshot.bits.assign(snapshot.bits.size(), ~uint32_t{0});
+        snapshot.endpoints = {{three.x, three.y}};
+        snapshot.end_portal = 0;
+        snapshot.relaxation = 0;
+        std::atomic_bool cancel{false};
+        BuildResult midpoint, edges;
+        snapshot.navigation_samples = 1;
+        BuildRoute(snapshot, midpoint, cancel);
+        snapshot.navigation_samples = 3;
+        BuildRoute(snapshot, edges, cancel);
+        assert(midpoint.connected && edges.connected);
+        assert(midpoint.length > 30000.f && edges.length < 12000.f);
+        assert(edges.waypoints.empty() && edges.end_point);
+        for (size_t i = 1; i < edges.route.size(); ++i) {
+            const auto a = edges.route[i - 1], b = edges.route[i];
+            for (int step = 0; step <= 100; ++step) {
+                const float t = step / 100.f;
+                const GW::Vec2f p{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t};
+                bool on_mesh = false;
+                for (const auto& trap : snapshot.maps[a.zplane].trapezoids) {
+                    const auto nearest = ClosestPoint(&trap, p);
+                    if (hypotf(nearest.x - p.x, nearest.y - p.y) <= .25f) { on_mesh = true; break; }
+                }
+                assert(on_mesh);
+            }
+        }
+        std::cout << "Sparkfly corridor regression: midpoint " << midpoint.length << " -> passage edges " << edges.length << '\n';
+    }
+    {
+        auto original = Snapshot();
+        original.maps.push_back(Plane({{0, 0, 1024, 1024}, {1024, 0, 2048, 1024}}, 9000));
+        original.maps[0].links[0].push_back(9001);
+        original.maps[0].links[1].push_back(9000);
+        original.confirmed_fog.insert(0x123456789abcdef0ULL);
+        original.skipped.insert(19);
+        const auto path = std::filesystem::temp_directory_path() / "worldcompletion-roundtrip.wcrp";
+        completion::SaveReplaySnapshot(original, path);
+        CartographyData::Mask mask{};
+        std::vector<uint8_t> bytes;
+        auto restored = completion::LoadReplaySnapshot<BuildSnapshot>(path, mask, bytes);
+        assert(restored.bits == original.bits);
+        assert(restored.confirmed_fog == original.confirmed_fog);
+        assert(restored.skipped == original.skipped);
+        assert(restored.maps[0].links[0][0] == restored.maps[0].addresses[1]);
+        BuildResult before, after;
+        std::atomic_bool cancel{false};
+        BuildRoute(original, before, cancel);
+        BuildRoute(restored, after, cancel);
+        assert(before.length == after.length && before.reveals == after.reveals);
+        assert(before.route.size() == after.route.size());
+        for (size_t i = 0; i < before.route.size(); ++i)
+            assert(before.route[i].x == after.route[i].x && before.route[i].y == after.route[i].y && before.route[i].zplane == after.route[i].zplane);
+        std::filesystem::remove(path);
+    }
     {
         Doorway door;
         door.pos = {9000, 500};
@@ -215,7 +280,7 @@ int main()
     {
         auto snapshot = Snapshot();
         snapshot.maps.push_back(Plane({{0, 0, 20000, 20000}}, 50));
-        snapshot.relaxation = 0;
+        snapshot.relaxation = 8;
         Fog(snapshot, 1, 3);
         Fog(snapshot, 5, 3);
         std::atomic_bool cancelled{false};
@@ -239,10 +304,10 @@ int main()
         BuildResult expanded;
         BuildRoute(snapshot, expanded, cancelled);
         Validate(snapshot, expanded);
-        size_t next = 0;
-        for (const auto& stop : expanded.waypoints)
-            if (next < original.waypoints.size() && stop.x == original.waypoints[next].x && stop.y == original.waypoints[next].y) ++next;
-        assert(next == original.waypoints.size());
+        bool kept_all = true;
+        for (const auto& old : original.waypoints)
+            kept_all &= std::ranges::any_of(expanded.waypoints, [&](const auto& stop) { return stop.x == old.x && stop.y == old.y; });
+        assert(kept_all || expanded.refinement.after + 1024.f < expanded.refinement.before);
         assert(expanded.waypoints.size() > original.waypoints.size());
         snapshot.previous_waypoints.push_back({-9999, -9999, 0}); // Invalid old stop discarded.
         BuildResult invalid;
@@ -310,6 +375,88 @@ int main()
         BuildRoute(snapshot, expired, cancelled);
         Validate(snapshot, expired);
         assert(expired.waypoints[0].x < 6144);
+    }
+    {
+        auto snapshot = Snapshot();
+        snapshot.maps.push_back(Plane({{0, 0, 22000, 22000}}, 1000));
+        snapshot.player = {1000, 18000, 0};
+        snapshot.previous_waypoints = {{18000, 18000, 0}, {18000, 12000, 0}, {3000, 12000, 0}};
+        snapshot.endpoints = {{13000, 2000}};
+        snapshot.end_portal = 0;
+        Fog(snapshot, 5, 2);
+        Fog(snapshot, 5, 4);
+        Fog(snapshot, 0, 4);
+        std::atomic_bool cancelled{false};
+        BuildResult corrected;
+        BuildRoute(snapshot, corrected, cancelled);
+        Validate(snapshot, corrected);
+        assert(corrected.waypoints.size() <= 3);
+        assert(corrected.waypoints.front().x < 6144); // Nearby west stop before crossing east.
+        assert(corrected.length < 42000); // Old forced order was over 52000.
+        snapshot.previous_waypoints = corrected.waypoints;
+        BuildResult stable;
+        BuildRoute(snapshot, stable, cancelled);
+        Validate(snapshot, stable);
+        bool unchanged = stable.waypoints.size() == corrected.waypoints.size();
+        if (unchanged) for (size_t i = 0; i < corrected.waypoints.size(); ++i) {
+            unchanged &= stable.waypoints[i].x == corrected.waypoints[i].x;
+            unchanged &= stable.waypoints[i].y == corrected.waypoints[i].y;
+        }
+        assert(unchanged || stable.length + std::max(1024.f, corrected.length * .05f) < corrected.length);
+        std::unordered_set<uint32_t> stable_fog;
+        for (const auto& cells : stable.reveals) stable_fog.insert(cells.begin(), cells.end());
+        for (const auto& cells : corrected.reveals) for (const auto cell : cells) assert(stable_fog.contains(cell));
+    }
+    {
+        auto snapshot = Snapshot();
+        snapshot.maps.push_back(Plane({{0, 0, 25000, 25000}}, 1100));
+        snapshot.player = {1536, 13824, 0};
+        snapshot.relaxation = 0;
+        Fog(snapshot, 0, 3);
+        std::atomic_bool cancelled{false};
+        BuildResult wall;
+        BuildRoute(snapshot, wall, cancelled);
+        Validate(snapshot, wall);
+        assert(wall.waypoints.size() == 1);
+        assert(wall.waypoints[0].x == snapshot.player.x); // No center detour for equal coverage.
+        assert(wall.length < 1.f);
+        for (uint32_t y = 2; y <= 4; ++y)
+            for (uint32_t x = 0; x <= 2; ++x) Fog(snapshot, x, y);
+        BuildResult center;
+        BuildRoute(snapshot, center, cancelled);
+        Validate(snapshot, center);
+        assert(center.waypoints.size() == 1);
+        assert(center.waypoints[0].x >= 3072 && center.waypoints[0].x < 6144);
+        assert(center.reveals[0].size() == 9); // Center covers more than the wall stop.
+    }
+    {
+        auto snapshot = Snapshot();
+        snapshot.height = 32;
+        snapshot.bits.assign(32, ~uint32_t{0});
+        snapshot.anchor = {0, 1024};
+        snapshot.bounds = snapshot.discovery_bounds = {{0, 0}, {1024, 1024}};
+        snapshot.maps.push_back(Plane({{0, 0, 98304, 98304}}, 1200));
+        snapshot.relaxation = 0;
+        for (uint32_t y = 2; y <= 27; y += 5)
+            for (uint32_t x = 2; x <= 27; x += 5) Fog(snapshot, x, y);
+        std::atomic_bool cancelled{false};
+        BuildResult original;
+        BuildRoute(snapshot, original, cancelled);
+        assert(original.waypoints.size() == 36);
+        snapshot.relaxation = 3;
+        snapshot.restarts = 4;
+        BuildResult improved;
+        BuildRoute(snapshot, improved, cancelled);
+        Validate(snapshot, improved);
+        assert(improved.length + 1000.f < original.length);
+        assert(improved.refinement.after <= improved.refinement.before);
+        assert(std::abs(improved.length - improved.refinement.after) < 2.f);
+        std::unordered_set<uint32_t> covered;
+        for (const auto& reveal : improved.reveals) covered.insert(reveal.begin(), reveal.end());
+        for (uint32_t y = 2; y <= 27; y += 5)
+            for (uint32_t x = 2; x <= 27; x += 5) assert(covered.contains(y * 32 + x));
+        std::cout << "36-stop production route: " << original.length << " -> " << improved.length
+                  << " game units; all discovery targets retained\n";
     }
     for (const float offset : {0.f, 20000.f, -20000.f}) {
         const auto plane = Plane({{offset - 1.f, offset - 1.f, offset + .25f, offset + .25f}}, 1);

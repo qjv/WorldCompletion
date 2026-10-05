@@ -31,6 +31,22 @@ namespace completion {
         return std::hypot(a.x - b.x, a.y - b.y);
     }
 
+    inline float ShortestPortalParameter(Point before, Point after, Portal edge)
+    {
+        const auto [a, b] = edge;
+        const double dx = b.x - a.x, dy = b.y - a.y;
+        const double edge_sq = dx * dx + dy * dy;
+        if (edge_sq <= 1e-8) return 0.f;
+        const double ax = before.x - a.x, ay = before.y - a.y;
+        const double bx = after.x - a.x, by = after.y - a.y;
+        const double height_a = std::fabs(dx * ay - dy * ax);
+        const double height_b = std::fabs(dx * by - dy * bx);
+        const double ta = (ax * dx + ay * dy) / edge_sq;
+        const double tb = (bx * dx + by * dy) / edge_sq;
+        const double heights = height_a + height_b;
+        return static_cast<float>(std::clamp(heights > 1e-8 ? (ta * height_b + tb * height_a) / heights : (ta + tb) * .5, 0., 1.));
+    }
+
     inline std::optional<Portal> SharedBoundary(const Point (&a)[4], const Point (&b)[4])
     {
         for (size_t i = 0; i < 4; ++i) {
@@ -100,9 +116,21 @@ namespace completion {
         return total + (order.empty() ? 0.f : finish[order.back()]);
     }
 
+    inline std::vector<size_t> StableOrder(const Costs &costs, const std::vector<float> &finish,
+                                           std::vector<size_t> optimized, std::vector<size_t> previous)
+    {
+        if (previous.empty()) return optimized;
+        if (optimized.empty()) return previous;
+        const float old_cost = OrderCost(costs, previous, finish);
+        const float new_cost = OrderCost(costs, optimized, finish);
+        // Preserve small ordering ties, but never lock in substantial backtracking.
+        if (new_cost + std::max(1024.f, old_cost * .05f) < old_cost) return optimized;
+        return previous;
+    }
+
     template <class Check>
     std::vector<size_t> OptimizeOrder(const Costs &costs, const std::vector<float> &finish, int passes, int restarts, uint32_t seed,
-                                      Check check)
+                                      Check check, const std::vector<std::vector<size_t>>& spatial_seeds = {})
     {
         const size_t n = finish.size();
         if (!n) return {};
@@ -149,6 +177,12 @@ namespace completion {
             best.push_back(at);
             pool.erase(next);
         }
+        bool symmetric = true;
+        for (size_t i = 0; i < n; ++i) {
+            check();
+            for (size_t j = i + 1; j < n; ++j)
+                if (std::fabs(costs[i][j] - costs[j][i]) > .01f) symmetric = false;
+        }
         const auto improve = [&](std::vector<size_t> &order) {
             for (int pass = 0; pass < passes; ++pass) {
                 bool changed = false;
@@ -156,8 +190,14 @@ namespace completion {
                     check();
                     const size_t before = i ? order[i - 1] : n;
                     for (size_t k = i + 1; k < n; ++k) {
-                        const float old_cost = costs[before][order[i]] + (k + 1 < n ? costs[order[k]][order[k + 1]] : finish[order[k]]);
-                        const float new_cost = costs[before][order[k]] + (k + 1 < n ? costs[order[i]][order[k + 1]] : finish[order[i]]);
+                        float old_cost = costs[before][order[i]] + (k + 1 < n ? costs[order[k]][order[k + 1]] : finish[order[k]]);
+                        float new_cost = costs[before][order[k]] + (k + 1 < n ? costs[order[i]][order[k + 1]] : finish[order[i]]);
+                        if (!symmetric) {
+                            for (size_t j = i; j < k; ++j) {
+                                old_cost += costs[order[j]][order[j + 1]];
+                                new_cost += costs[order[j + 1]][order[j]];
+                            }
+                        }
                         if (new_cost + .01f >= old_cost) continue;
                         std::reverse(order.begin() + static_cast<ptrdiff_t>(i), order.begin() + static_cast<ptrdiff_t>(k + 1));
                         changed = true;
@@ -189,6 +229,13 @@ namespace completion {
         };
         improve(best);
         float best_cost = OrderCost(costs, best, finish);
+        for (auto trial : spatial_seeds) {
+            check();
+            if (trial.size() != n) continue;
+            improve(trial);
+            const float trial_cost = OrderCost(costs, trial, finish);
+            if (trial_cost < best_cost) { best = std::move(trial); best_cost = trial_cost; }
+        }
         if (std::ranges::any_of(finish, [](float cost) { return cost != 0.f; })) {
             std::vector<size_t> terminal_seed, remaining(n);
             std::iota(remaining.begin(), remaining.end(), 0);
@@ -209,14 +256,62 @@ namespace completion {
                 best_cost = cost;
             }
         }
-        std::mt19937 random(seed);
-        for (int restart = 0; restart < restarts; ++restart) {
+        for (int restart = 0; restart < std::clamp(restarts, 0, 12); ++restart) {
             check();
-            auto trial = best;
-            for (int kick = 0; kick < 3; ++kick) {
-                size_t a = random() % n, b = random() % n;
-                if (a > b) std::swap(a, b);
-                std::reverse(trial.begin() + static_cast<ptrdiff_t>(a), trial.begin() + static_cast<ptrdiff_t>(b + 1));
+            // Independent, reproducible seeds explore different construction
+            // algorithms rather than repeatedly nudging the same local optimum.
+            std::mt19937 random(seed ^ (0x9e3779b9u * static_cast<uint32_t>(restart + 1)));
+            std::vector<size_t> trial, unused(n);
+            std::iota(unused.begin(), unused.end(), 0);
+            if (restart % 4 == 0) {
+                size_t from = random() % n;
+                trial.push_back(from);
+                unused.erase(unused.begin() + static_cast<ptrdiff_t>(from));
+                while (!unused.empty()) {
+                    check();
+                    const auto closest = std::min_element(unused.begin(), unused.end(),
+                        [&](size_t a, size_t b) { return costs[from][a] < costs[from][b]; });
+                    trial.push_back(from = *closest);
+                    unused.erase(closest);
+                }
+            }
+            else if (restart % 4 == 1) {
+                // Cheapest insertion, with a shuffled node admission order.
+                std::shuffle(unused.begin(), unused.end(), random);
+                for (const size_t node : unused) {
+                    check();
+                    float best_delta = std::numeric_limits<float>::infinity();
+                    size_t destination = 0;
+                    for (size_t pos = 0; pos <= trial.size(); ++pos) {
+                        const size_t before = pos ? trial[pos - 1] : n;
+                        const float delta = costs[before][node] + (pos < trial.size()
+                            ? costs[node][trial[pos]] - costs[before][trial[pos]]
+                            : finish[node] - (before == n ? 0.f : finish[before]));
+                        if (delta < best_delta) { best_delta = delta; destination = pos; }
+                    }
+                    trial.insert(trial.begin() + static_cast<ptrdiff_t>(destination), node);
+                }
+            }
+            else if (restart % 4 == 2) {
+                // Choose among the three nearest remaining stops at each step.
+                size_t from = n;
+                while (!unused.empty()) {
+                    check();
+                    const size_t choices = std::min(size_t{3}, unused.size());
+                    std::partial_sort(unused.begin(), unused.begin() + static_cast<ptrdiff_t>(choices), unused.end(),
+                        [&](size_t a, size_t b) { return costs[from][a] < costs[from][b]; });
+                    const size_t pick = random() % choices;
+                    trial.push_back(from = unused[pick]);
+                    unused.erase(unused.begin() + static_cast<ptrdiff_t>(pick));
+                }
+            }
+            else {
+                trial = best;
+                for (int kick = 0; kick < 3; ++kick) {
+                    size_t a = random() % n, b = random() % n;
+                    if (a > b) std::swap(a, b);
+                    std::reverse(trial.begin() + static_cast<ptrdiff_t>(a), trial.begin() + static_cast<ptrdiff_t>(b + 1));
+                }
             }
             improve(trial);
             const float cost = OrderCost(costs, trial, finish);

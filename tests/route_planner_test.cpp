@@ -118,12 +118,87 @@ void TestPortalEndpoints()
     }
 }
 
+void TestSeedArena()
+{
+    std::mt19937 rng(8675309);
+    bool found_improvement = false;
+    for (int fixture = 0; fixture < 20; ++fixture) {
+        constexpr size_t n = 24;
+        const auto costs = RandomMetric(n, rng);
+        std::vector<float> finish(n);
+        for (auto& cost : finish) cost = static_cast<float>(rng() % 1000);
+        const auto baseline = OptimizeOrder(costs, finish, 8, 0, 71, [] {});
+        float best_cost = OrderCost(costs, baseline, finish);
+        for (int attempts = 1; attempts <= 8; ++attempts) {
+            const auto order = OptimizeOrder(costs, finish, 8, attempts, 71, [] {});
+            const float cost = OrderCost(costs, order, finish);
+            assert(cost <= best_cost + .01f); // More trials never discard the incumbent.
+            found_improvement |= cost + .01f < OrderCost(costs, baseline, finish);
+            best_cost = cost;
+            assert(order == OptimizeOrder(costs, finish, 8, attempts, 71, [] {}));
+            auto sorted = order;
+            std::sort(sorted.begin(), sorted.end());
+            for (size_t i = 0; i < n; ++i) assert(sorted[i] == i);
+        }
+    }
+    assert(found_improvement);
+}
+
+void TestDirectedCosts()
+{
+    constexpr size_t n = 20;
+    std::mt19937 rng(2026);
+    Costs costs(n + 1, std::vector<float>(n + 1));
+    for (size_t i = 0; i <= n; ++i)
+        for (size_t j = 0; j <= n; ++j) if (i != j) costs[i][j] = 10.f + static_cast<float>(rng() % 1000);
+    for (size_t k = 0; k <= n; ++k)
+        for (size_t i = 0; i <= n; ++i)
+            for (size_t j = 0; j <= n; ++j) costs[i][j] = std::min(costs[i][j], costs[i][k] + costs[k][j]);
+    std::vector<float> finish(n);
+    std::vector<size_t> nearest, unused(n);
+    std::iota(unused.begin(), unused.end(), 0);
+    size_t from = n;
+    while (!unused.empty()) {
+        const auto next = std::min_element(unused.begin(), unused.end(), [&](size_t a, size_t b) { return costs[from][a] < costs[from][b]; });
+        nearest.push_back(from = *next);
+        unused.erase(next);
+    }
+    const auto result = OptimizeOrder(costs, finish, 16, 8, 17, [] {});
+    assert(OrderCost(costs, result, finish) <= OrderCost(costs, nearest, finish) + .01f);
+}
+
 int main()
 {
+    {
+        std::mt19937 random(481);
+        const auto coordinate = [&] { return static_cast<float>(static_cast<int>(random() % 2001) - 1000); };
+        for (int sample = 0; sample < 300; ++sample) {
+            const Point before{coordinate(), coordinate()}, after{coordinate(), coordinate()};
+            Portal edge{{coordinate(), coordinate()}, {coordinate(), coordinate()}};
+            if (sample == 0) edge.second = edge.first;
+            if (sample == 1) { edge = {{0, 0}, {10, 0}}; }
+            const auto objective = [&](float t) {
+                const Point p{edge.first.x + t * (edge.second.x - edge.first.x), edge.first.y + t * (edge.second.y - edge.first.y)};
+                return Distance(before, p) + Distance(after, p);
+            };
+            float lo = 0, hi = 1;
+            for (int iteration = 0; iteration < 60; ++iteration) {
+                const float a = (2 * lo + hi) / 3, b = (lo + 2 * hi) / 3;
+                if (objective(a) < objective(b)) hi = b; else lo = a;
+            }
+            const float t = ShortestPortalParameter(before, after, edge);
+            assert(t >= 0 && t <= 1);
+            assert(objective(t) <= objective((lo + hi) * .5f) + .002f);
+        }
+        assert(ShortestPortalParameter({2, 0}, {8, 0}, {{0, 0}, {10, 0}}) == .5f);
+        assert(ShortestPortalParameter({20, 1}, {30, -1}, {{0, 0}, {10, 0}}) == 1.f);
+    }
     TestBoundaries();
     TestCorridors();
     TestExactOrder();
     TestPortalEndpoints();
+    TestSeedArena();
+    TestDirectedCosts();
     TestLargeOrderAndCancellation();
     std::cout << "Route planner: geometry, exact ordering, bounded refinement, determinism, cancellation passed\n";
 }
