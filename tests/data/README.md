@@ -34,3 +34,5 @@ WC_PORTAL_SAMPLES=3 WC_SEARCH_SEED=1 python3 tools/replay_route.py tests/data/sp
 ```
 
 `WC_COMPARE_ORDER=1` compares the captured order with swapping points 1 and 2 and with the exact order for the same stops. `WC_DUMP_ROUTE=1` prints the resulting numbered waypoints. These diagnostic options do not interact with the game.
+
+`sparkfly-swamp-border.wcrp.gz` captures the later Bird’s Eye border route, with 114 remaining targets. The position pass reduces the replayed coverage route from 49,350 to 47,600 units while retaining those targets. A whole-cell translation is not always safe: the diagnostic reports lost coverage before accepting any shift.

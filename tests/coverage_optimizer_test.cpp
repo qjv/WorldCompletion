@@ -35,6 +35,27 @@ int main()
 {
     const Stop start{{0, 0}, {}}, finish{{10, 0}, {}};
     {
+        const Stop origin{{0, 0}, {}}, end{{0, 10000}, {}};
+        const std::vector<Stop> border{{{3072, 5000}, {1, 2}, true}};
+        const auto inward = [](const Stop& current, const Stop&, const Stop*) {
+            auto valid = current; valid.pos.x = 0;
+            auto incomplete = valid; incomplete.reveals = {1};
+            return std::vector<Stop>{incomplete, valid};
+        };
+        CoverageStats stats;
+        auto relaxed = RelaxCoveragePositions(border, origin, &end, metric, inward, [] {}, [] { return true; }, stats);
+        assert(relaxed.size() == 1 && relaxed[0].pos.x == 0 && stats.moves == 1);
+        CheckCoverage(relaxed, 2);
+        auto limited = RelaxCoveragePositions(border, origin, &end, metric, inward, [] {}, [] { return false; }, stats);
+        assert(limited[0].pos.x == 3072);
+        const auto loses_coverage = [](const Stop& current, const Stop&, const Stop*) {
+            auto invalid = current; invalid.pos.x = 0; invalid.reveals = {1};
+            return std::vector<Stop>{invalid};
+        };
+        auto complete = RelaxCoveragePositions(border, origin, &end, metric, loses_coverage, [] {}, [] { return true; }, stats);
+        assert(complete[0].pos.x == 3072);
+    }
+    {
         const std::vector<Stop> original{{{5, 0}, {1}}};
         const auto distant = [](const Stop& current, const Stop&, const Stop*) {
             auto worse = current;

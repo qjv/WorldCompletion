@@ -1937,10 +1937,15 @@ namespace {
                 return hypotf(option->pos.x - before.pos.x, option->pos.y - before.pos.y) +
                     (after ? hypotf(option->pos.x - after->pos.x, option->pos.y - after->pos.y) : 0.f);
             };
-            const size_t count = std::min(size_t{12}, nearby.size());
-            std::partial_sort(nearby.begin(), nearby.begin() + static_cast<ptrdiff_t>(count), nearby.end(),
+            std::stable_sort(nearby.begin(), nearby.end(),
                 [&](const Candidate *a, const Candidate *b) { return proximity(a) < proximity(b); });
-            for (size_t i = 0; i < count; ++i) { options.push_back(*nearby[i]); add_positions(*nearby[i]); }
+            std::set<std::tuple<int, int, uint32_t>> represented;
+            for (const auto* option : nearby) {
+                if (!represented.emplace(option->cell_x, option->cell_y, option->pos.zplane).second) continue;
+                options.push_back(*option);
+                add_positions(*option);
+                if (represented.size() == 12) break;
+            }
             return options;
         };
         if (snapshot.covering_planner && relaxation_budget > 0) {
@@ -1966,9 +1971,21 @@ namespace {
                 }
             }
             refined_stops = stable_stops;
+            const auto position_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::array{150, 1000, 2000}[quality]);
+            refined_stops = completion::RelaxCoveragePositions(std::move(refined_stops), start_stop,
+                end_trap ? &finish_stop : nullptr, metric, place_stop, check,
+                [&] { return within_budget() && std::chrono::steady_clock::now() < position_deadline; }, result.refinement);
+            const float positioned_cost = walking_cost(refined_stops);
+            if (positioned_cost + std::max(256.f, original_cost * .005f) < stable_cost) {
+                stable_stops = refined_stops;
+                stable_cost = positioned_cost;
+            }
             refined_stops = completion::ImproveCoveringTour(std::move(refined_stops), coverage_pool, start_stop,
                 end_trap ? &finish_stop : nullptr, snapshot.covering_seed ? snapshot.covering_seed : static_cast<uint32_t>(map_id),
                 metric, check, within_budget, result.refinement, place_stop, snapshot.covering_shortlist, snapshot.covering_removal, snapshot.covering_project);
+            refined_stops = completion::RelaxCoveragePositions(std::move(refined_stops), start_stop,
+                end_trap ? &finish_stop : nullptr, metric, place_stop, check, within_budget, result.refinement);
+            result.refinement.after = walking_cost(refined_stops);
             result.refinement.before = original_cost;
             if (!snapshot.previous_waypoints.empty() && result.refinement.before - result.refinement.after <
                 std::max(1024.f, result.refinement.before * .05f)) {

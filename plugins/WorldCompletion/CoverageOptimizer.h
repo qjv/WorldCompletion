@@ -11,6 +11,51 @@ struct CoverageStats {
     bool budget_exhausted = false;
 };
 
+// Cheap position polishing comes before changing the cover set. Keep each
+// stop's uniquely assigned targets, but allow other reveal cells and points
+// within them when the complete walking path becomes shorter.
+template<class Stop, class Metric, class Place, class Check, class Continue>
+std::vector<Stop> RelaxCoveragePositions(std::vector<Stop> stops, const Stop& start,
+    const Stop* finish, Metric metric, Place placements, Check check, Continue running, CoverageStats& stats)
+{
+    const auto straight = [](const Stop& a, const Stop& b) { return std::hypot(a.pos.x - b.pos.x, a.pos.y - b.pos.y); };
+    for (size_t i = 0; i < stops.size() && running(); ++i) {
+        check();
+        std::unordered_set<uint32_t> unique(stops[i].reveals.begin(), stops[i].reveals.end());
+        for (size_t j = 0; j < stops.size(); ++j) if (i != j)
+            for (const auto fog : stops[j].reveals) unique.erase(fog);
+        const Stop& before = i ? stops[i - 1] : start;
+        const Stop* after = i + 1 < stops.size() ? &stops[i + 1] : finish;
+        float best_cost = metric(before, stops[i]) + (after ? metric(stops[i], *after) : 0.f);
+        const float old_cost = best_cost;
+        Stop best = stops[i];
+        auto options = placements(stops[i], before, after);
+        std::erase_if(options, [&](const Stop& option) {
+            return !std::ranges::all_of(unique, [&](uint32_t fog) { return std::ranges::find(option.reveals, fog) != option.reveals.end(); });
+        });
+        const auto bound = [&](const Stop& option) { return straight(before, option) + (after ? straight(option, *after) : 0.f); };
+        std::stable_sort(options.begin(), options.end(), [&](const Stop& a, const Stop& b) { return bound(a) < bound(b); });
+        std::vector<Stop> shortlist;
+        for (const auto& option : options) {
+            if (bound(option) + .1f >= best_cost) break;
+            if (std::ranges::any_of(shortlist, [&](const Stop& other) { return straight(option, other) < 768.f; })) continue;
+            shortlist.push_back(option);
+            if (shortlist.size() == 8) break;
+        }
+        for (const auto& option : shortlist) {
+            check();
+            if (!running()) break;
+            if (bound(option) + .1f >= best_cost) continue;
+            const float approach = metric(before, option);
+            if (approach + (after ? straight(option, *after) : 0.f) + .1f >= best_cost || !running()) continue;
+            const float distance = approach + (after ? metric(option, *after) : 0.f);
+            if (distance + .1f < best_cost) { best = option; best_cost = distance; }
+        }
+        if (best_cost + .1f < old_cost) { stops[i] = std::move(best); ++stats.moves; }
+    }
+    return stops;
+}
+
 // All candidates already have valid footing and reveal sets. Geometry, actual
 // walking distance, ordering, cancellation and runtime limits remain caller-owned.
 template<class Stop, class Metric, class Place, class Order, class Check, class Continue>

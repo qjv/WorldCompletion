@@ -227,6 +227,36 @@ def main():
             if (best) std::cout << "target " << fog << " closest=" << closest << " stand=" << best->pos.x << ',' << best->pos.y << '\n';
         }
         const auto place_stop =''')
+    if os.getenv("WC_SHIFT_LEFT"):
+        code = code.replace('        if (refined_stops.empty() && !end_trap) {', r'''
+        std::unordered_set<uint32_t> shift_required;
+        for (const auto& s : refined_stops) shift_required.insert(s.reveals.begin(), s.reveals.end());
+        for (size_t width = 1; width <= std::min(size_t{4}, refined_stops.size()); ++width)
+            for (size_t first = 0; first + width <= refined_stops.size(); ++first) {
+                auto trial = refined_stops;
+                bool possible = true;
+                for (size_t i = first; i < first + width; ++i) {
+                    const auto options = footing_options.find({trial[i].cell_x - 1, trial[i].cell_y});
+                    const Candidate* best = nullptr; float distance = FLT_MAX;
+                    if (options != footing_options.end()) for (const auto& option : options->second) {
+                        if (option.pos.zplane != trial[i].pos.zplane) continue;
+                        const float d = hypotf(option.pos.x - (trial[i].pos.x - 3072.f), option.pos.y - trial[i].pos.y);
+                        if (d < distance) { best = &option; distance = d; }
+                    }
+                    if (!best) { possible = false; break; }
+                    trial[i] = *best;
+                }
+                if (!possible) continue;
+                std::unordered_set<uint32_t> covered;
+                for (const auto& s : trial) covered.insert(s.reveals.begin(), s.reveals.end());
+                size_t missing = 0;
+                for (const auto fog : shift_required) missing += !covered.contains(fog);
+                float distance = 0; const Candidate* previous = &start_stop;
+                if (!missing) { for (const auto& stop : trial) { distance += metric(*previous, stop); previous = &stop; }
+                    if (end_trap) distance += metric(*previous, finish_stop); }
+                std::cout << "shift_left first=" << first + 1 << " width=" << width << " missing=" << missing << " length=" << distance << '\n';
+            }
+        if (refined_stops.empty() && !end_trap) {''')
     with tempfile.TemporaryDirectory(prefix="worldcompletion-replay-") as folder:
         cpp = Path(folder) / "replay.cpp"
         digest = hashlib.sha256(code.encode())
