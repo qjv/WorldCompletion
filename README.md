@@ -86,8 +86,9 @@ The tests run on Linux with AddressSanitizer and UndefinedBehaviorSanitizer. The
 ## Credits
 
 - [GWToolbox++ and Guild Wars Dev Hub](https://github.com/gwdevhub/GWToolboxpp): the plugin host, plugin base classes, settings support, and utilities this project builds on.
-- [GWCA](https://github.com/GWCA/GWCA): access to Guild Wars game state, navigation data, and game APIs.
+- [GWCA++ bundled with GWToolbox++](https://github.com/gwdevhub/GWToolboxpp/tree/master/Dependencies/GWCA): the game-state, navigation and effect APIs used by this build. Created by KAOS (4D 1) and HasKha; the [original standalone repository](https://github.com/GregLando113/GWCA) is archived.
 - [Dear ImGui](https://github.com/ocornut/imgui): the settings interface and overlay controls.
+- [MinHook](https://github.com/TsudaKageyu/minhook): the Windows hooking library linked through the Toolbox SDK and plugin framework.
 - [msvc-wine](https://github.com/mstorsjo/msvc-wine): the Linux build toolchain wrappers.
 - ArenaNet: Guild Wars and its game data. This project is unofficial and is not affiliated with ArenaNet or NCSOFT.
 
