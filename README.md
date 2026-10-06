@@ -91,4 +91,15 @@ The tests run on Linux with AddressSanitizer and UndefinedBehaviorSanitizer. The
 - [msvc-wine](https://github.com/mstorsjo/msvc-wine): the Linux build toolchain wrappers.
 - ArenaNet: Guild Wars and its game data. This project is unofficial and is not affiliated with ArenaNet or NCSOFT.
 
+### Routing algorithms
+
+- [Edsger W. Dijkstra, 1959](https://doi.org/10.1007/BF01386390): shortest-path search on the passage graph.
+- [Michael Held and Richard M. Karp, 1962](https://doi.org/10.1137/0110015): subset dynamic programming for exact ordering of up to 15 selected stops, adapted to a player start and optional finish portal.
+- [G. A. Croes, 1958](https://doi.org/10.1287/opre.6.6.791): 2-opt route improvement. Larger tours also use standard nearest-neighbor, cheapest-insertion and relocation heuristics.
+- [John R. Current and David A. Schilling, 1989](https://www.ic.unicamp.br/~fusberti/problems/csp/): the covering salesman formulation, where a subset of visits covers all targets. The plugin adapts this objective to overlapping discovery footprints and an open route.
+- [Stephen L. Smith and Frank Imeson, GLNS, 2017](https://ece.uwaterloo.ca/~sl2smith/GLNS/): inspiration for adaptive removal and repair, spatial and detour-based removals, and temporary exploration while retaining the best complete route. Our coverage-aware search is an adaptation, not the GLNS solver or its source code.
+- [Bähnemann et al., 2019](https://arxiv.org/abs/1907.09224): inspiration for the experimental region and sweep planner. That prototype is disabled in normal routing because it performed worse on the saved captures.
+
+The passage sampling, portal barriers, discovery checks and position relaxation are implemented for this addon. Research links and measured comparisons are in [route-strategies.md](docs/route-strategies.md).
+
 Released under the [MIT license](LICENSE). The original Guild Wars Dev Hub copyright notice is retained.
